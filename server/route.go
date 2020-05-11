@@ -254,6 +254,9 @@ func (c *client) processInboundRoutedMsg(msg []byte) {
 		return
 	}
 
+	// For debugging
+	c.ingressReporting(acc, msg)
+
 	// Check for no interest, short circuit if so.
 	// This is the fanout scale.
 	if len(r.psubs)+len(r.qsubs) > 0 {

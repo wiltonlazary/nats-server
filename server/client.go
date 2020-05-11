@@ -2598,6 +2598,9 @@ func (c *client) deliverMsg(sub *subscription, subject, mh, msg []byte, gwrply b
 	client.outMsgs++
 	client.outBytes += msgSize
 
+	// Debugging
+	client.egressReporting(client.acc, c.pa.subject, c.pa.reply, msg)
+
 	// Check for internal subscriptions.
 	if client.kind == SYSTEM || client.kind == JETSTREAM || client.kind == ACCOUNT {
 		s := client.srv
@@ -2893,6 +2896,94 @@ func isReservedReply(reply []byte) bool {
 	return false
 }
 
+func (c *client) ingressReporting(acc *Account, msg []byte) {
+	if acc == nil || c.srv == nil {
+		return
+	}
+
+	sys := c.srv.SystemAccount()
+	if acc != sys {
+		return
+	}
+
+	var id string
+
+	// We have system account if we are here.
+	if string(c.pa.subject) == "$SYS.REQ.SERVER.PING" {
+		reply := string(c.pa.reply)
+		ntoks := uint8(numTokens(reply))
+		if ntoks > 0 {
+			id = fmt.Sprintf("%s:%s", tokenAt(reply, ntoks-2), tokenAt(reply, ntoks-1))
+		}
+		c.Noticef("HMDBG INBOUND REQUEST [%v] [RTT:%v] [%v]\n", c.srv.info.Name, c.rtt, id)
+		// Add reply to track.
+		acc.mu.Lock()
+		if acc.tracking == nil {
+			acc.tracking = make(map[string]struct{})
+		}
+		acc.tracking[reply] = struct{}{}
+		acc.mu.Unlock()
+
+		// Expiration for each reply subject.
+		time.AfterFunc(2*time.Minute, func() {
+			acc.mu.Lock()
+			delete(acc.tracking, reply)
+			acc.mu.Unlock()
+		})
+	} else {
+		acc.mu.RLock()
+		_, ok := acc.tracking[string(c.pa.subject)]
+		acc.mu.RUnlock()
+		if ok {
+			reply := string(c.pa.subject)
+			ntoks := uint8(numTokens(reply))
+			if ntoks > 0 {
+				id = fmt.Sprintf("%s:%s", tokenAt(reply, ntoks-2), tokenAt(reply, ntoks-1))
+			}
+			c.Noticef("HMDBG INBOUND RESPONSE [%v] [RTT:%v] [%v]\n", c.srv.info.Name, c.rtt, id)
+		}
+	}
+}
+
+func (c *client) egressReporting(acc *Account, subject, reply, msg []byte) {
+	if acc == nil || c.srv == nil {
+		return
+	}
+
+	c.mu.Unlock()
+	sys := c.srv.SystemAccount()
+	c.mu.Lock()
+
+	if acc != sys {
+		return
+	}
+
+	var id string
+
+	// We have system account
+	if string(subject) == "$SYS.REQ.SERVER.PING" {
+		reply := string(reply)
+		ntoks := uint8(numTokens(reply))
+		if ntoks > 0 {
+			id = fmt.Sprintf("%s:%s", tokenAt(reply, ntoks-2), tokenAt(reply, ntoks-1))
+		}
+		c.Noticef("HMDBG OUTBOUND REQUEST [%v] [RTT:%v] [%v]\n", c.srv.info.Name, c.rtt, id)
+	} else {
+		acc.mu.RLock()
+		_, ok := acc.tracking[string(subject)]
+		acc.mu.RUnlock()
+
+		if ok {
+			reply := string(subject)
+			ntoks := uint8(numTokens(reply))
+			if ntoks > 0 {
+				id = fmt.Sprintf("%s:%s", tokenAt(reply, ntoks-2), tokenAt(reply, ntoks-1))
+			}
+			c.Noticef("HMDBG OUTBOUND RESPONSE [%v] [RTT:%v] [%v]\n", c.srv.info.Name, c.rtt, id)
+		}
+	}
+}
+
 // This will decide to call the client code or router code.
 func (c *client) processInboundMsg(msg []byte) {
 	switch c.kind {
@@ -2909,6 +3000,9 @@ func (c *client) processInboundMsg(msg []byte) {
 
 // processInboundClientMsg is called to process an inbound msg from a client.
 func (c *client) processInboundClientMsg(msg []byte) bool {
+	// For debugging
+	c.ingressReporting(c.acc, msg)
+
 	// Update statistics
 	// The msg includes the CR_LF, so pull back out for accounting.
 	c.in.msgs++

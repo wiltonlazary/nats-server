@@ -2760,6 +2760,9 @@ func (c *client) processInboundGatewayMsg(msg []byte) {
 		return
 	}
 
+	// For debugging
+	c.ingressReporting(acc, msg)
+
 	// Check if this is a service reply subject (_R_)
 	noInterest := len(r.psubs) == 0
 	checkNoInterest := true

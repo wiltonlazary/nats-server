@@ -73,6 +73,9 @@ type Account struct {
 	prand       *rand.Rand
 	eventIds    *nuid.NUID
 	eventIdsMu  sync.Mutex
+
+	// For debug
+	tracking map[string]struct{}
 }
 
 // Account based limits.
