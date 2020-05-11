@@ -2915,7 +2915,7 @@ func (c *client) ingressReporting(acc *Account, msg []byte) {
 		if ntoks > 0 {
 			id = fmt.Sprintf("%s:%s", tokenAt(reply, ntoks-2), tokenAt(reply, ntoks-1))
 		}
-		c.Noticef("HMDBG INBOUND REQUEST [%v] [RTT:%v] [%v]\n", c.srv.info.Name, c.rtt, id)
+		c.Noticef("HMDBG INBOUND REQUEST [%v] [RTT:%v] [%v]", c.srv.info.Name, c.rtt, id)
 		// Add reply to track.
 		acc.mu.Lock()
 		if acc.tracking == nil {
@@ -2940,7 +2940,7 @@ func (c *client) ingressReporting(acc *Account, msg []byte) {
 			if ntoks > 0 {
 				id = fmt.Sprintf("%s:%s", tokenAt(reply, ntoks-2), tokenAt(reply, ntoks-1))
 			}
-			c.Noticef("HMDBG INBOUND RESPONSE [%v] [RTT:%v] [%v]\n", c.srv.info.Name, c.rtt, id)
+			c.Noticef("HMDBG INBOUND RESPONSE [%v] [RTT:%v] [%v]", c.srv.info.Name, c.rtt, id)
 		}
 	}
 }
@@ -2967,7 +2967,7 @@ func (c *client) egressReporting(acc *Account, subject, reply, msg []byte) {
 		if ntoks > 0 {
 			id = fmt.Sprintf("%s:%s", tokenAt(reply, ntoks-2), tokenAt(reply, ntoks-1))
 		}
-		c.Noticef("HMDBG OUTBOUND REQUEST [%v] [RTT:%v] [%v]\n", c.srv.info.Name, c.rtt, id)
+		c.Noticef("HMDBG OUTBOUND REQUEST [%v] [RTT:%v] [%v]", c.srv.info.Name, c.rtt, id)
 	} else {
 		acc.mu.RLock()
 		_, ok := acc.tracking[string(subject)]
@@ -2979,7 +2979,7 @@ func (c *client) egressReporting(acc *Account, subject, reply, msg []byte) {
 			if ntoks > 0 {
 				id = fmt.Sprintf("%s:%s", tokenAt(reply, ntoks-2), tokenAt(reply, ntoks-1))
 			}
-			c.Noticef("HMDBG OUTBOUND RESPONSE [%v] [RTT:%v] [%v]\n", c.srv.info.Name, c.rtt, id)
+			c.Noticef("HMDBG OUTBOUND RESPONSE [%v] [RTT:%v] [%v]", c.srv.info.Name, c.rtt, id)
 		}
 	}
 }
