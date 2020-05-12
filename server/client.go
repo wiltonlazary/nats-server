@@ -2599,7 +2599,11 @@ func (c *client) deliverMsg(sub *subscription, subject, mh, msg []byte, gwrply b
 	client.outBytes += msgSize
 
 	// Debugging
-	client.egressReporting(c.acc, c.pa.subject, c.pa.reply, msg)
+	eacc := client.acc
+	if eacc == nil {
+		eacc = c.acc
+	}
+	client.egressReporting(eacc, c.pa.subject, c.pa.reply, msg)
 
 	// Check for internal subscriptions.
 	if client.kind == SYSTEM || client.kind == JETSTREAM || client.kind == ACCOUNT {
@@ -2906,9 +2910,6 @@ func isHMSubject(subject string) bool {
 	// Timestamp
 	ts, err := strconv.ParseInt(tokenAt(subject, ntoks), 10, 64)
 	if err != nil {
-		return false
-	}
-	if time.Unix(0, ts).After(time.Now()) {
 		return false
 	}
 	// Sequence
