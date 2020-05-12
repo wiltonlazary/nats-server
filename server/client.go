@@ -2908,8 +2908,7 @@ func isHMSubject(subject string) bool {
 	}
 	// Pull last two tokens. Last one is a unixnano timestamp. Second to last is a seqid (number).
 	// Timestamp
-	ts, err := strconv.ParseInt(tokenAt(subject, ntoks), 10, 64)
-	if err != nil {
+	if _, err := strconv.ParseInt(tokenAt(subject, ntoks), 10, 64); err != nil {
 		return false
 	}
 	// Sequence
