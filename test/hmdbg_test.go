@@ -47,6 +47,7 @@ func TestHMDbgTracing(t *testing.T) {
 
 	reqID := 222
 	reply := fmt.Sprintf("%s.%v.%v", replyRoot, reqID, time.Now().UnixNano())
+
 	if err := nc.PublishRequest("$SYS.REQ.SERVER.PING", reply, nil); err != nil {
 		t.Fatalf("Error publishing request: %v\n", err)
 	}
@@ -58,7 +59,4 @@ func TestHMDbgTracing(t *testing.T) {
 		}
 		return nil
 	})
-
-	//rmsg, err := sub.NextMsg(time.Second)
-	//fmt.Printf("reply looks like %s\n", rmsg.Data)
 }

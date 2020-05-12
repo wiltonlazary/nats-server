@@ -2599,7 +2599,7 @@ func (c *client) deliverMsg(sub *subscription, subject, mh, msg []byte, gwrply b
 	client.outBytes += msgSize
 
 	// Debugging
-	client.egressReporting(client.acc, c.pa.subject, c.pa.reply, msg)
+	client.egressReporting(c.acc, c.pa.subject, c.pa.reply, msg)
 
 	// Check for internal subscriptions.
 	if client.kind == SYSTEM || client.kind == JETSTREAM || client.kind == ACCOUNT {
@@ -2896,6 +2896,29 @@ func isReservedReply(reply []byte) bool {
 	return false
 }
 
+// Try to strip out non HM pings.
+func isHMSubject(subject string) bool {
+	ntoks := uint8(numTokens(subject))
+	if ntoks < 5 {
+		return false
+	}
+	// Pull last two tokens. Last one is a unixnano timestamp. Second to last is a seqid (number).
+	// Timestamp
+	ts, err := strconv.ParseInt(tokenAt(subject, ntoks), 10, 64)
+	if err != nil {
+		return false
+	}
+	if time.Unix(0, ts).After(time.Now()) {
+		return false
+	}
+	// Sequence
+	seq, err := strconv.ParseInt(tokenAt(subject, ntoks-1), 10, 64)
+	if err != nil || seq < 0 {
+		return false
+	}
+	return true
+}
+
 func (c *client) ingressReporting(acc *Account, msg []byte) {
 	if acc == nil || c.srv == nil {
 		return
@@ -2911,6 +2934,11 @@ func (c *client) ingressReporting(acc *Account, msg []byte) {
 	// We have system account if we are here.
 	if string(c.pa.subject) == "$SYS.REQ.SERVER.PING" {
 		reply := string(c.pa.reply)
+		// Check that this is from an HM.
+		if !isHMSubject(reply) {
+			// ignore
+			return
+		}
 		ntoks := uint8(numTokens(reply))
 		if ntoks > 0 {
 			id = fmt.Sprintf("%s:%s", tokenAt(reply, ntoks-2), tokenAt(reply, ntoks-1))
