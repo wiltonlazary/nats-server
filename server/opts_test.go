@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1807,6 +1808,144 @@ func TestParseServiceLatency(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseExport(t *testing.T) {
+	conf := `
+		system_account: sys
+		accounts {
+			sys {
+				exports [{
+					stream "$SYS.SERVER.ACCOUNT.*.CONNS"
+					account_token_position 4
+				}]
+			}
+			accE {
+				exports [{
+					service foo.*
+					account_token_position 2
+				}]
+				users [{
+					user ue
+					password pwd
+				}],
+			}
+			accI1 {
+				imports [{
+					service { 
+						account accE
+						subject foo.accI1
+					}
+					to foo
+				},{
+					stream {
+						account sys
+						subject "$SYS.SERVER.ACCOUNT.accI1.CONNS"
+					}
+				}],
+				users [{
+					user u1
+					password pwd
+				}], 
+			}
+			accI2 {
+				imports [{
+					service {
+						account accE
+						subject foo.accI2
+					}
+					to foo
+				},{
+					stream {
+						account sys
+						subject "$SYS.SERVER.ACCOUNT.accI2.CONNS"
+					}
+				}],
+				users [{
+					user u2
+					password pwd
+				}],
+			}
+		}`
+
+	f := createConfFile(t, []byte(conf))
+	s, o := RunServerWithConfig(f)
+	if s == nil {
+		t.Fatal("Failed startup")
+	}
+	defer s.Shutdown()
+	defer os.Remove(f)
+
+	connect := func(user string) *nats.Conn {
+		nc, err := nats.Connect(fmt.Sprintf("nats://%s:pwd@%s:%d", user, o.Host, o.Port))
+		if err != nil {
+			t.Fatal("Failed connect to ", user, err)
+		}
+		return nc
+	}
+
+	nc1 := connect("u1")
+	defer nc1.Close()
+	nc2 := connect("u2")
+	defer nc1.Close()
+
+	subscribe := func(nc *nats.Conn, msgs int, subj string) (*sync.WaitGroup, *nats.Subscription) {
+		wg := sync.WaitGroup{}
+		wg.Add(msgs)
+		sub, err := nc.Subscribe(subj, func(msg *nats.Msg) {
+			t.Log(time.Now().String(), msg.Subject, string(msg.Data))
+
+			wg.Done()
+		})
+		if err != nil {
+			t.Fatal("error during subscribe", err)
+		}
+		return &wg, sub
+	}
+
+	//Subscribe to CONNS events
+	wg1, s1 := subscribe(nc1, 2, "$SYS.SERVER.ACCOUNT.accI1.CONNS")
+	defer s1.Unsubscribe()
+	wg2, s2 := subscribe(nc2, 2, "$SYS.SERVER.ACCOUNT.accI2.CONNS")
+	defer s2.Unsubscribe()
+
+	// Trigger 2 CONNS event
+	nc3 := connect("u1")
+	nc3.Close()
+	nc4 := connect("u2")
+	nc4.Close()
+
+	// test service
+	ncE := connect("ue")
+	defer ncE.Close()
+
+	wge := sync.WaitGroup{}
+	wge.Add(2)
+	se, err := ncE.Subscribe("foo.*", func(msg *nats.Msg) {
+		msg.Respond(msg.Data)
+		wge.Done()
+	})
+	if err != nil {
+		t.Fatal("Received error during subscribe ", err)
+	}
+	defer se.Unsubscribe()
+
+	request := func(nc *nats.Conn, msg string) {
+		if m, err := nc.Request("foo", []byte(msg), time.Second); err != nil {
+			t.Fatal("Failed request ", msg, err)
+		} else if m == nil {
+			t.Fatal("No response msg")
+		} else if string(m.Data) != msg {
+			t.Fatal("Wrong response msg", string(m.Data))
+		}
+	}
+
+	request(nc1, "1")
+	request(nc2, "1")
+
+	wge.Wait()
+	wg1.Wait()
+	wg2.Wait()
 }
 
 func TestAccountUsersLoadedProperly(t *testing.T) {
