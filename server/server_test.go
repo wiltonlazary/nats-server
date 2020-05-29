@@ -1238,6 +1238,7 @@ func TestAcceptLoopsDoNotLeaveOpenedConn(t *testing.T) {
 		{"gateway", func(o *Options) (string, int) { return o.Gateway.Host, o.Gateway.Port }},
 		{"leafnode", func(o *Options) (string, int) { return o.LeafNode.Host, o.LeafNode.Port }},
 		{"websocket", func(o *Options) (string, int) { return o.Websocket.Host, o.Websocket.Port }},
+		{"mqtt", func(o *Options) (string, int) { return o.MQTT.Host, o.MQTT.Port }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			o := DefaultOptions()
@@ -1256,6 +1257,8 @@ func TestAcceptLoopsDoNotLeaveOpenedConn(t *testing.T) {
 			o.Websocket.Port = -1
 			o.Websocket.HandshakeTimeout = 1
 			o.Websocket.NoTLS = true
+			o.MQTT.Host = "127.0.0.1"
+			o.MQTT.Port = -1
 			s := RunServer(o)
 			defer s.Shutdown()
 
@@ -1335,6 +1338,8 @@ func TestServerShutdownDuringStart(t *testing.T) {
 	o.Websocket.Port = -1
 	o.Websocket.HandshakeTimeout = 1
 	o.Websocket.NoTLS = true
+	o.MQTT.Host = "127.0.0.1"
+	o.MQTT.Port = -1
 
 	// We are going to test that if the server is shutdown
 	// while Start() runs (in this case, before), we don't
@@ -1375,6 +1380,9 @@ func TestServerShutdownDuringStart(t *testing.T) {
 	}
 	if s.websocket.listener != nil {
 		listeners = append(listeners, "websocket")
+	}
+	if s.mqtt.listener != nil {
+		listeners = append(listeners, "mqtt")
 	}
 	s.mu.Unlock()
 	if len(listeners) > 0 {
