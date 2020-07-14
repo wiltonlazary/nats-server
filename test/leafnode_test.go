@@ -1460,6 +1460,77 @@ func TestLeafNodeUserPermsForConnection(t *testing.T) {
 	checkNoSubInterest(t, s, acc.GetName(), "foo.33", 20*time.Millisecond)
 }
 
+func TestLeafNodeRespPermsDeadlock(t *testing.T) {
+	t.SkipNow()
+
+	content := `
+		port: -1
+		authorization {
+			leaf_user = {
+			  publish = ["req.one"]
+			  allow_responses = true
+			  subscribe = "_INBOX.>"
+			}
+			users = [
+			  {user: leaf_user, password: pwd, permissions: $leaf_user}
+			  {user: user, password: pwd}
+			]
+		}
+		leafnodes {
+			port: -1
+			%s
+		}
+	`
+	config := fmt.Sprintf(content, "")
+	lnconf := createConfFile(t, []byte(config))
+	defer os.Remove(lnconf)
+	ln, opts := RunServerWithConfig(lnconf)
+	defer ln.Shutdown()
+
+	slconfig := fmt.Sprintf(content, fmt.Sprintf(`
+		remotes [
+			{ url: nats://leaf_user:pwd@127.0.0.1:%d }
+		]
+	`, opts.LeafNode.Port))
+	slconf := createConfFile(t, []byte(slconfig))
+	defer os.Remove(slconf)
+	sl, _ := RunServerWithConfig(slconf)
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, ln)
+	checkLeafNodeConnected(t, sl)
+
+	// Connect responder to ln server
+	nc, err := nats.Connect(ln.ClientURL(), nats.UserInfo("user", "pwd"))
+	if err != nil {
+		t.Fatalf("Unable to connect: %v", err)
+	}
+	defer nc.Close()
+
+	nc.Subscribe("req.one", func(m *nats.Msg) {
+		m.Respond([]byte("reply"))
+	})
+	nc.Flush()
+
+	checkSubInterest(t, sl, "$G", "req.one", time.Second)
+
+	// Connect the requestor to sl server
+	nc2, err := nats.Connect(sl.ClientURL(), nats.UserInfo("user", "pwd"))
+	if err != nil {
+		t.Fatalf("Unable to connect: %v", err)
+	}
+	defer nc2.Close()
+
+	// Issue request
+	resp, err := nc2.Request("req.one", []byte("help"), 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Error getting reply: %v", err)
+	}
+	if reply := string(resp.Data); reply != "reply" {
+		t.Fatalf("Expected %q, got %q", "reply", reply)
+	}
+}
+
 func TestLeafNodeMultipleAccounts(t *testing.T) {
 	// So we will create a main server with two accounts. The remote server, acting as a leaf node, will simply have
 	// the $G global account and no auth. Make sure things work properly here.
