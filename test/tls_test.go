@@ -786,6 +786,175 @@ func TestTLSGatewaysCertificateCNBasedAuth(t *testing.T) {
 	}
 }
 
+func TestTLSRoutesCertificateImplicitAllowPass(t *testing.T) {
+	testTLSRoutesCertificateImplicitAllow(t, true)
+}
+
+func TestTLSRoutesCertificateImplicitAllowFail(t *testing.T) {
+	testTLSRoutesCertificateImplicitAllow(t, false)
+}
+
+func testTLSRoutesCertificateImplicitAllow(t *testing.T, pass bool) {
+	t.Helper()
+	// Base config for the servers
+	cfg, err := ioutil.TempFile("", "cfg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(cfg.Name())
+	cfg.WriteString(fmt.Sprintf(`
+		cluster {
+		  tls {
+			cert_file = "./configs/certs/tlsauth/server.pem"
+			key_file = "./configs/certs/tlsauth/server-key.pem"
+			ca_file = "./configs/certs/tlsauth/ca.pem"
+			verify_cert_and_check_known_urls = true
+			insecure = %t
+			timeout = 1
+		  }
+		}
+	`, !pass)) // set insecure to skip verification on the outgoing end
+	if err = cfg.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	optsA := LoadConfig(cfg.Name())
+	optsB := LoadConfig(cfg.Name())
+
+	routeURLs := "nats://localhost:9935, nats://localhost:9936"
+	if !pass {
+		routeURLs = "nats://127.0.0.1:9935, nats://127.0.0.1:9936"
+	}
+	optsA.Host = "127.0.0.1"
+	optsA.Port = 9335
+	optsA.Cluster.Name = "xyz"
+	optsA.Cluster.Host = optsA.Host
+	optsA.Cluster.Port = 9935
+	optsA.Routes = server.RoutesFromStr(routeURLs)
+	optsA.NoSystemAccount = true
+	srvA := RunServer(optsA)
+	defer srvA.Shutdown()
+
+	optsB.Host = "127.0.0.1"
+	optsB.Port = 9336
+	optsB.Cluster.Name = "xyz"
+	optsB.Cluster.Host = optsB.Host
+	optsB.Cluster.Port = 9936
+	optsB.Routes = server.RoutesFromStr(routeURLs)
+	optsB.NoSystemAccount = true
+	srvB := RunServer(optsB)
+	defer srvB.Shutdown()
+
+	// srvC is not connected to srvA and srvB due to wrong cert
+	if pass {
+		checkNumRoutes(t, srvA, 1)
+		checkNumRoutes(t, srvB, 1)
+	} else {
+		time.Sleep(1 * time.Second) // the fail case uses the IP, so a short wait is sufficient
+		if srvA.NumRoutes() != 0 || srvB.NumRoutes() != 0 {
+			t.Fatal("No route connection expected")
+		}
+	}
+}
+
+func TestTLSGatewaysCertificateImplicitAllowPass(t *testing.T) {
+	testTLSGatewaysCertificateImplicitAllow(t, true)
+}
+
+func TestTLSGatewaysCertificateImplicitAllowFail(t *testing.T) {
+	testTLSGatewaysCertificateImplicitAllow(t, false)
+}
+
+func testTLSGatewaysCertificateImplicitAllow(t *testing.T, pass bool) {
+	t.Helper()
+	// Base config for the servers
+	cfg, err := ioutil.TempFile("", "cfg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(cfg.Name())
+	cfg.WriteString(fmt.Sprintf(`
+		gateway {
+		  tls {
+			cert_file = "./configs/certs/tlsauth/server.pem"
+			key_file = "./configs/certs/tlsauth/server-key.pem"
+			ca_file = "./configs/certs/tlsauth/ca.pem"
+			verify_cert_and_check_known_urls = true
+			insecure = %t
+			timeout = 1
+		  }
+		}
+	`, !pass)) // set insecure to skip verification on the outgoing end
+	if err = cfg.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	optsA := LoadConfig(cfg.Name())
+	optsB := LoadConfig(cfg.Name())
+
+	urlA := "nats://localhost:9995"
+	urlB := "nats://localhost:9996"
+	if !pass {
+		urlA = "nats://127.0.0.1:9995"
+		urlB = "nats://127.0.0.1:9996"
+	}
+
+	gwA, err := url.Parse(urlA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gwB, err := url.Parse(urlB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	optsA.Host = "127.0.0.1"
+	optsA.Port = -1
+	optsA.Gateway.Name = "A"
+	optsA.Gateway.Port = 9995
+
+	optsB.Host = "127.0.0.1"
+	optsB.Port = -1
+	optsB.Gateway.Name = "B"
+	optsB.Gateway.Port = 9996
+
+	gateways := make([]*server.RemoteGatewayOpts, 2)
+	gateways[0] = &server.RemoteGatewayOpts{
+		Name: optsA.Gateway.Name,
+		URLs: []*url.URL{gwA},
+	}
+	gateways[1] = &server.RemoteGatewayOpts{
+		Name: optsB.Gateway.Name,
+		URLs: []*url.URL{gwB},
+	}
+
+	optsA.Gateway.Gateways = gateways
+	optsB.Gateway.Gateways = gateways
+
+	server.SetGatewaysSolicitDelay(100 * time.Millisecond)
+	defer server.ResetGatewaysSolicitDelay()
+
+	srvA := RunServer(optsA)
+	defer srvA.Shutdown()
+
+	srvB := RunServer(optsB)
+	defer srvB.Shutdown()
+
+	// Because we need to use "localhost" in the gw URLs (to match
+	// hostname in the user/CN), the server may try to connect to
+	// a [::1], etc.. that may or may not work, so give a lot of
+	// time for that to complete ok.
+	if pass {
+		waitForOutboundGateways(t, srvA, 1, 5*time.Second)
+		waitForOutboundGateways(t, srvB, 1, 5*time.Second)
+	} else {
+		time.Sleep(1 * time.Second) // the fail case uses the IP, so a short wait is sufficient
+		if srvA.NumOutboundGateways() != 0 || srvB.NumOutboundGateways() != 0 {
+			t.Fatal("No outbound gateway connection expected")
+		}
+	}
+}
+
 func TestTLSVerifyClientCertificate(t *testing.T) {
 	srv, opts := RunServerWithConfig("./configs/tlsverify_noca.conf")
 	defer srv.Shutdown()
@@ -1371,7 +1540,10 @@ func TestTLSClientAuthWithRDNSequence(t *testing.T) {
 				  users = [
 				    { user = "CN=*.example.com,OU=NATS,O=NATS,L=Los Angeles,ST=CA,C=US,DC=example,DC=com",
                                         permissions = { subscribe = { deny = ">" }} }
+
+				    # This should take precedence since it is in the RFC2253 order.
 				    { user = "DC=com,DC=example,CN=*.example.com,O=NATS,OU=NATS,L=Los Angeles,ST=CA,C=US" }
+
 				    { user = "CN=*.example.com,OU=NATS,O=NATS,L=Los Angeles,ST=CA,C=US",
                                         permissions = { subscribe = { deny = ">" }} }
 				  ]
@@ -1382,6 +1554,209 @@ func TestTLSClientAuthWithRDNSequence(t *testing.T) {
 			//
 			nats.ClientCert("./configs/certs/rdns/client-d.pem", "./configs/certs/rdns/client-d.key"),
 			nil,
+			nil,
+		},
+		{
+			"connect with tls and RDN includes multiple CN elements",
+			`
+				port: -1
+				%s
+
+				authorization {
+				  users = [
+				    { user = "DC=com,DC=acme,OU=Organic Units,OU=Users,CN=jdoe,CN=123456,CN=John Doe" }
+                                  ]
+				}
+			`,
+			//
+			// OpenSSL: -subj "/CN=John Doe/CN=123456/CN=jdoe/OU=Users/OU=Organic Units/DC=acme/DC=com"
+			// Go:       CN=jdoe,OU=Users+OU=Organic Units
+			// RFC2253:  DC=com,DC=acme,OU=Organic Units,OU=Users,CN=jdoe,CN=123456,CN=John Doe
+			//
+			nats.ClientCert("./configs/certs/rdns/client-e.pem", "./configs/certs/rdns/client-e.key"),
+			nil,
+			nil,
+		},
+		{
+			"connect with tls and DN includes a multi value RDN",
+			`
+				port: -1
+				%s
+
+				authorization {
+				  users = [
+				    { user = "CN=John Doe,DC=DEV+O=users,DC=OpenSSL,DC=org" }
+                                  ]
+				}
+			`,
+			//
+			// OpenSSL: -subj "/DC=org/DC=OpenSSL/DC=DEV+O=users/CN=John Doe"
+			// Go:       CN=John Doe,O=users
+			// RFC2253:  CN=John Doe,DC=DEV+O=users,DC=OpenSSL,DC=org
+			//
+			nats.ClientCert("./configs/certs/rdns/client-f.pem", "./configs/certs/rdns/client-f.key"),
+			nil,
+			nil,
+		},
+		{
+			"connect with tls and DN includes a multi value RDN but there is no match",
+			`
+				port: -1
+				%s
+
+				authorization {
+				  users = [
+				    { user = "CN=John Doe,DC=DEV,DC=OpenSSL,DC=org" }
+                                  ]
+				}
+			`,
+			//
+			// OpenSSL: -subj "/DC=org/DC=OpenSSL/DC=DEV+O=users/CN=John Doe" -multivalue-rdn
+			// Go:       CN=John Doe,O=users
+			// RFC2253:  CN=John Doe,DC=DEV+O=users,DC=OpenSSL,DC=org
+			//
+			nats.ClientCert("./configs/certs/rdns/client-f.pem", "./configs/certs/rdns/client-f.key"),
+			errors.New("nats: Authorization Violation"),
+			nil,
+		},
+		{
+			"connect with tls and DN includes a multi value RDN that are reordered",
+			`
+				port: -1
+				%s
+
+				authorization {
+				  users = [
+				    { user = "CN=John Doe,O=users+DC=DEV,DC=OpenSSL,DC=org" }
+                                  ]
+				}
+			`,
+			//
+			// OpenSSL: -subj "/DC=org/DC=OpenSSL/DC=DEV+O=users/CN=John Doe" -multivalue-rdn
+			// Go:       CN=John Doe,O=users
+			// RFC2253:  CN=John Doe,DC=DEV+O=users,DC=OpenSSL,DC=org
+			//
+			nats.ClientCert("./configs/certs/rdns/client-f.pem", "./configs/certs/rdns/client-f.key"),
+			nil,
+			nil,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			content := fmt.Sprintf(test.config, `
+				tls {
+					cert_file: "configs/certs/rdns/server.pem"
+					key_file: "configs/certs/rdns/server.key"
+					ca_file: "configs/certs/rdns/ca.pem"
+					timeout: 5
+					verify_and_map: true
+				}
+			`)
+			conf := createConfFile(t, []byte(content))
+			defer os.Remove(conf)
+			s, opts := RunServerWithConfig(conf)
+			defer s.Shutdown()
+
+			nc, err := nats.Connect(fmt.Sprintf("tls://localhost:%d", opts.Port),
+				test.certs,
+				nats.RootCAs("./configs/certs/rdns/ca.pem"),
+			)
+			if test.err == nil && err != nil {
+				t.Errorf("Expected to connect, got %v", err)
+			} else if test.err != nil && err == nil {
+				t.Errorf("Expected error on connect")
+			} else if test.err != nil && err != nil {
+				// Error on connect was expected
+				if test.err.Error() != err.Error() {
+					t.Errorf("Expected error %s, got: %s", test.err, err)
+				}
+				return
+			}
+			defer nc.Close()
+
+			nc.Subscribe("ping", func(m *nats.Msg) {
+				m.Respond([]byte("pong"))
+			})
+			nc.Flush()
+
+			_, err = nc.Request("ping", []byte("ping"), 250*time.Millisecond)
+			if test.rerr != nil && err == nil {
+				t.Errorf("Expected error getting response")
+			} else if test.rerr == nil && err != nil {
+				t.Errorf("Expected response")
+			}
+		})
+	}
+}
+
+func TestTLSClientAuthWithRDNSequenceReordered(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		config string
+		certs  nats.Option
+		err    error
+		rerr   error
+	}{
+		{
+			"connect with tls and DN includes a multi value RDN that are reordered",
+			`
+				port: -1
+				%s
+
+				authorization {
+				  users = [
+				    { user = "DC=org,DC=OpenSSL,O=users+DC=DEV,CN=John Doe" }
+                                  ]
+				}
+			`,
+			//
+			// OpenSSL: -subj "/DC=org/DC=OpenSSL/DC=DEV+O=users/CN=John Doe" -multivalue-rdn
+			// Go:       CN=John Doe,O=users
+			// RFC2253:  CN=John Doe,DC=DEV+O=users,DC=OpenSSL,DC=org
+			//
+			nats.ClientCert("./configs/certs/rdns/client-f.pem", "./configs/certs/rdns/client-f.key"),
+			nil,
+			nil,
+		},
+		{
+			"connect with tls and DN includes a multi value RDN that are reordered but not equal RDNs",
+			`
+				port: -1
+				%s
+
+				authorization {
+				  users = [
+				    { user = "DC=org,DC=OpenSSL,O=users,CN=John Doe" }
+                                  ]
+				}
+			`,
+			//
+			// OpenSSL: -subj "/DC=org/DC=OpenSSL/DC=DEV+O=users/CN=John Doe" -multivalue-rdn
+			// Go:       CN=John Doe,O=users
+			// RFC2253:  CN=John Doe,DC=DEV+O=users,DC=OpenSSL,DC=org
+			//
+			nats.ClientCert("./configs/certs/rdns/client-f.pem", "./configs/certs/rdns/client-f.key"),
+			errors.New("nats: Authorization Violation"),
+			nil,
+		},
+		{
+			"connect with tls and DN includes a multi value RDN that are reordered but not equal RDNs",
+			`
+				port: -1
+				%s
+
+				authorization {
+				  users = [
+				    { user = "DC=OpenSSL, DC=org, O=users, CN=John Doe" }
+                                  ]
+				}
+			`,
+			//
+			// OpenSSL: -subj "/DC=org/DC=OpenSSL/DC=DEV+O=users/CN=John Doe" -multivalue-rdn
+			// Go:       CN=John Doe,O=users
+			// RFC2253:  CN=John Doe,DC=DEV+O=users,DC=OpenSSL,DC=org
+			//
+			nats.ClientCert("./configs/certs/rdns/client-f.pem", "./configs/certs/rdns/client-f.key"),
+			errors.New("nats: Authorization Violation"),
 			nil,
 		},
 	} {

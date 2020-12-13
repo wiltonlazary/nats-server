@@ -305,12 +305,14 @@ RESET:
 				}
 			}
 			c.mu.Lock()
+
 			// We can have an override for account here.
 			if pm.acc != nil {
 				c.acc = pm.acc
 			} else {
 				c.acc = sysacc
 			}
+
 			// Prep internal structures needed to send message.
 			c.pa.subject = []byte(pm.sub)
 			c.pa.size = len(b)
@@ -1408,6 +1410,7 @@ func (s *Server) systemSubscribe(subject, queue string, internalOnly bool, cb ms
 	if queue != "" {
 		q = []byte(queue)
 	}
+	// Now create the subscription
 	return c.processSub([]byte(subject), q, []byte(sid), cb, internalOnly)
 }
 
@@ -1618,7 +1621,7 @@ func (s *Server) debugSubscribers(sub *subscription, c *client, subject, reply s
 
 	// If we are only local, go ahead and return.
 	if expected == 0 {
-		s.sendInternalAccountMsg(c.acc, reply, nsubs)
+		s.sendInternalAccountMsg(nil, reply, nsubs)
 		return
 	}
 
@@ -1662,7 +1665,7 @@ func (s *Server) debugSubscribers(sub *subscription, c *client, subject, reply s
 		delete(s.sys.replies, replySubj)
 		s.mu.Unlock()
 		// Send the response.
-		s.sendInternalAccountMsg(c.acc, reply, atomic.LoadInt32(&nsubs))
+		s.sendInternalAccountMsg(nil, reply, atomic.LoadInt32(&nsubs))
 	}()
 }
 

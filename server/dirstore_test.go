@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,49 +36,49 @@ import (
 func require_True(t *testing.T, b bool) {
 	t.Helper()
 	if !b {
-		t.Errorf("require true, but got false")
+		t.Fatalf("require true, but got false")
 	}
 }
 
 func require_False(t *testing.T, b bool) {
 	t.Helper()
 	if b {
-		t.Errorf("require no false, but got true")
+		t.Fatalf("require no false, but got true")
 	}
 }
 
 func require_NoError(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
-		t.Errorf("require no error, but got: %v", err)
+		t.Fatalf("require no error, but got: %v", err)
 	}
 }
 
 func require_Error(t *testing.T, err error) {
 	t.Helper()
 	if err == nil {
-		t.Errorf("require no error, but got: %v", err)
+		t.Fatalf("require error, but got none")
 	}
 }
 
 func require_Equal(t *testing.T, a, b string) {
 	t.Helper()
 	if strings.Compare(a, b) != 0 {
-		t.Errorf("require equal, but got: %v != %v", a, b)
+		t.Fatalf("require equal, but got: %v != %v", a, b)
 	}
 }
 
 func require_NotEqual(t *testing.T, a, b [32]byte) {
 	t.Helper()
 	if bytes.Equal(a[:], b[:]) {
-		t.Errorf("require not equal, but got: %v != %v", a, b)
+		t.Fatalf("require not equal, but got: %v != %v", a, b)
 	}
 }
 
 func require_Len(t *testing.T, a, b int) {
 	t.Helper()
 	if a != b {
-		t.Errorf("require len, but got: %v != %v", a, b)
+		t.Fatalf("require len, but got: %v != %v", a, b)
 	}
 }
 
@@ -426,7 +427,7 @@ func TestExpiration(t *testing.T) {
 	dir, err := ioutil.TempDir(os.TempDir(), "jwtstore_test")
 	require_NoError(t, err)
 
-	dirStore, err := NewExpiringDirJWTStore(dir, false, false, NoDelete, time.Millisecond*100, 10, true, 0, nil)
+	dirStore, err := NewExpiringDirJWTStore(dir, false, false, NoDelete, time.Millisecond*50, 10, true, 0, nil)
 	require_NoError(t, err)
 	defer dirStore.Close()
 
@@ -436,28 +437,27 @@ func TestExpiration(t *testing.T) {
 		createTestAccount(t, dirStore, expSec, accountKey)
 	}
 
-	h := dirStore.Hash()
+	hBegin := dirStore.Hash()
+	account(100)
+	hNoExp := dirStore.Hash()
+	require_NotEqual(t, hBegin, hNoExp)
+	account(1)
+	nh2 := dirStore.Hash()
+	require_NotEqual(t, hNoExp, nh2)
+	assertStoreSize(t, dirStore, 2)
 
-	for i := 1; i <= 3; i++ {
-		account(i)
-		nh := dirStore.Hash()
-		require_NotEqual(t, h, nh)
-		h = nh
-	}
-	time.Sleep(500 * time.Millisecond)
-	for i := 3; i > 0; i-- {
+	failAt := time.Now().Add(4 * time.Second)
+	for time.Now().Before(failAt) {
+		time.Sleep(100 * time.Millisecond)
 		f, err := ioutil.ReadDir(dir)
 		require_NoError(t, err)
-		require_Len(t, len(f), i)
-		assertStoreSize(t, dirStore, i)
-
-		time.Sleep(time.Second)
-
-		nh := dirStore.Hash()
-		require_NotEqual(t, h, nh)
-		h = nh
+		if len(f) == 1 {
+			lh := dirStore.Hash()
+			require_Equal(t, string(hNoExp[:]), string(lh[:]))
+			return
+		}
 	}
-	assertStoreSize(t, dirStore, 0)
+	t.Fatalf("Waited more than 4 seconds for the file with expiration 1 second to expire")
 }
 
 func TestLimit(t *testing.T) {
@@ -506,7 +506,7 @@ func TestLimitNoEvict(t *testing.T) {
 	dir, err := ioutil.TempDir(os.TempDir(), "jwtstore_test")
 	require_NoError(t, err)
 
-	dirStore, err := NewExpiringDirJWTStore(dir, false, false, NoDelete, time.Millisecond*100, 2, false, 0, nil)
+	dirStore, err := NewExpiringDirJWTStore(dir, false, false, NoDelete, time.Millisecond*50, 2, false, 0, nil)
 	require_NoError(t, err)
 	defer dirStore.Close()
 
@@ -523,7 +523,7 @@ func TestLimitNoEvict(t *testing.T) {
 
 	createTestAccount(t, dirStore, 100, accountKey1)
 	assertStoreSize(t, dirStore, 1)
-	createTestAccount(t, dirStore, 2, accountKey2)
+	createTestAccount(t, dirStore, 1, accountKey2)
 	assertStoreSize(t, dirStore, 2)
 
 	hBefore := dirStore.Hash()
@@ -544,7 +544,7 @@ func TestLimitNoEvict(t *testing.T) {
 	hAfter := dirStore.Hash()
 	require_True(t, bytes.Equal(hBefore[:], hAfter[:]))
 	// wait for expiration of account2
-	time.Sleep(3 * time.Second)
+	time.Sleep(2200 * time.Millisecond)
 	err = dirStore.SaveAcc(pubKey, jwt)
 	require_NoError(t, err)
 	assertStoreSize(t, dirStore, 2)
@@ -586,11 +586,53 @@ func TestLruLoad(t *testing.T) {
 	require_NoError(t, err)
 }
 
+func TestLruVolume(t *testing.T) {
+	dir, err := ioutil.TempDir(os.TempDir(), "jwtstore_test")
+	require_NoError(t, err)
+
+	dirStore, err := NewExpiringDirJWTStore(dir, false, false, NoDelete, time.Millisecond*50, 2, true, 0, nil)
+	require_NoError(t, err)
+	defer dirStore.Close()
+	replaceCnt := 500 // needs to be bigger than 2 due to loop unrolling
+	keys := make([]string, replaceCnt)
+
+	key, err := nkeys.CreateAccount()
+	require_NoError(t, err)
+	keys[0], err = key.PublicKey()
+	require_NoError(t, err)
+	createTestAccount(t, dirStore, 10000, key) // not intended to expire
+	assertStoreSize(t, dirStore, 1)
+
+	key, err = nkeys.CreateAccount()
+	require_NoError(t, err)
+	keys[1], err = key.PublicKey()
+	require_NoError(t, err)
+	createTestAccount(t, dirStore, 10000, key)
+	assertStoreSize(t, dirStore, 2)
+
+	for i := 2; i < replaceCnt; i++ {
+		k, err := nkeys.CreateAccount()
+		require_NoError(t, err)
+		keys[i], err = k.PublicKey()
+		require_NoError(t, err)
+
+		createTestAccount(t, dirStore, 10000+rand.Intn(10000), k) // not intended to expire
+		assertStoreSize(t, dirStore, 2)
+		_, err = os.Stat(fmt.Sprintf("%s/%s.jwt", dir, keys[i-2]))
+		require_Error(t, err)
+		require_True(t, os.IsNotExist(err))
+		_, err = os.Stat(fmt.Sprintf("%s/%s.jwt", dir, keys[i-1]))
+		require_NoError(t, err)
+		_, err = os.Stat(fmt.Sprintf("%s/%s.jwt", dir, keys[i]))
+		require_NoError(t, err)
+	}
+}
+
 func TestLru(t *testing.T) {
 	dir, err := ioutil.TempDir(os.TempDir(), "jwtstore_test")
 	require_NoError(t, err)
 
-	dirStore, err := NewExpiringDirJWTStore(dir, false, false, NoDelete, time.Millisecond*100, 2, true, 0, nil)
+	dirStore, err := NewExpiringDirJWTStore(dir, false, false, NoDelete, time.Millisecond*50, 2, true, 0, nil)
 	require_NoError(t, err)
 	defer dirStore.Close()
 
@@ -605,32 +647,33 @@ func TestLru(t *testing.T) {
 	pKey3, err := accountKey3.PublicKey()
 	require_NoError(t, err)
 
-	createTestAccount(t, dirStore, 10, accountKey1)
+	createTestAccount(t, dirStore, 1000, accountKey1)
 	assertStoreSize(t, dirStore, 1)
-	createTestAccount(t, dirStore, 10, accountKey2)
+	createTestAccount(t, dirStore, 1000, accountKey2)
 	assertStoreSize(t, dirStore, 2)
-	createTestAccount(t, dirStore, 10, accountKey3)
+	createTestAccount(t, dirStore, 1000, accountKey3)
 	assertStoreSize(t, dirStore, 2)
 	_, err = os.Stat(fmt.Sprintf("%s/%s.jwt", dir, pKey1))
+	require_Error(t, err)
 	require_True(t, os.IsNotExist(err))
 	_, err = os.Stat(fmt.Sprintf("%s/%s.jwt", dir, pKey3))
 	require_NoError(t, err)
 
 	// update -> will change this keys position for eviction
-	createTestAccount(t, dirStore, 10, accountKey2)
+	createTestAccount(t, dirStore, 1000, accountKey2)
 	assertStoreSize(t, dirStore, 2)
 	// recreate -> will evict 3
 	createTestAccount(t, dirStore, 1, accountKey1)
 	assertStoreSize(t, dirStore, 2)
 	_, err = os.Stat(fmt.Sprintf("%s/%s.jwt", dir, pKey3))
 	require_True(t, os.IsNotExist(err))
-	// let key1 expire
-	time.Sleep(1500 * time.Millisecond)
+	// let key1 expire. sleep expSec=1 + 1 for rounding
+	time.Sleep(2200 * time.Millisecond)
 	assertStoreSize(t, dirStore, 1)
 	_, err = os.Stat(fmt.Sprintf("%s/%s.jwt", dir, pKey1))
 	require_True(t, os.IsNotExist(err))
 	// recreate key3 - no eviction
-	createTestAccount(t, dirStore, 10, accountKey3)
+	createTestAccount(t, dirStore, 1000, accountKey3)
 	assertStoreSize(t, dirStore, 2)
 }
 
@@ -699,7 +742,7 @@ func TestExpirationUpdate(t *testing.T) {
 	dir, err := ioutil.TempDir(os.TempDir(), "jwtstore_test")
 	require_NoError(t, err)
 
-	dirStore, err := NewExpiringDirJWTStore(dir, false, false, NoDelete, time.Millisecond*100, 10, true, 0, nil)
+	dirStore, err := NewExpiringDirJWTStore(dir, false, false, NoDelete, time.Millisecond*50, 10, true, 0, nil)
 	require_NoError(t, err)
 	defer dirStore.Close()
 
@@ -713,7 +756,7 @@ func TestExpirationUpdate(t *testing.T) {
 	require_NotEqual(t, h, nh)
 	h = nh
 
-	time.Sleep(2 * time.Second)
+	time.Sleep(2200 * time.Millisecond)
 	f, err := ioutil.ReadDir(dir)
 	require_NoError(t, err)
 	require_Len(t, len(f), 1)
@@ -723,7 +766,7 @@ func TestExpirationUpdate(t *testing.T) {
 	require_NotEqual(t, h, nh)
 	h = nh
 
-	time.Sleep(2 * time.Second)
+	time.Sleep(2200 * time.Millisecond)
 	f, err = ioutil.ReadDir(dir)
 	require_NoError(t, err)
 	require_Len(t, len(f), 1)
@@ -733,7 +776,7 @@ func TestExpirationUpdate(t *testing.T) {
 	require_NotEqual(t, h, nh)
 	h = nh
 
-	time.Sleep(2 * time.Second)
+	time.Sleep(2200 * time.Millisecond)
 	f, err = ioutil.ReadDir(dir)
 	require_NoError(t, err)
 	require_Len(t, len(f), 1)
@@ -743,7 +786,7 @@ func TestExpirationUpdate(t *testing.T) {
 	require_NotEqual(t, h, nh)
 	h = nh
 
-	time.Sleep(2 * time.Second)
+	time.Sleep(2200 * time.Millisecond)
 	f, err = ioutil.ReadDir(dir)
 	require_NoError(t, err)
 	require_Len(t, len(f), 0)
@@ -762,7 +805,7 @@ func TestTTL(t *testing.T) {
 		require_NoError(t, err)
 		require_Len(t, len(f), 1)
 	}
-	dirStore, err := NewExpiringDirJWTStore(dir, false, false, NoDelete, 100*time.Millisecond, 10, true, time.Second, nil)
+	dirStore, err := NewExpiringDirJWTStore(dir, false, false, NoDelete, 50*time.Millisecond, 10, true, time.Second, nil)
 	require_NoError(t, err)
 	defer dirStore.Close()
 
@@ -843,7 +886,7 @@ func TestNotificationOnPack(t *testing.T) {
 	notificationChan := make(chan struct{}, len(jwts)) // set to same len so all extra will block
 	notification := func(pubKey string) {
 		if _, ok := jwts[pubKey]; !ok {
-			t.Errorf("Key not found: %s", pubKey)
+			t.Fatalf("Key not found: %s", pubKey)
 		}
 		notificationChan <- struct{}{}
 	}

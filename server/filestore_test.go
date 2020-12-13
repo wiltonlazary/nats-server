@@ -60,6 +60,7 @@ func TestFileStoreBasics(t *testing.T) {
 	if state.Bytes != expectedSize {
 		t.Fatalf("Expected %d bytes, got %d", expectedSize, state.Bytes)
 	}
+
 	nsubj, _, nmsg, _, err := fs.LoadMsg(2)
 	if err != nil {
 		t.Fatalf("Unexpected error looking up msg: %v", err)
@@ -74,6 +75,27 @@ func TestFileStoreBasics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error looking up msg: %v", err)
 	}
+
+	remove := func(seq, expectedMsgs uint64) {
+		t.Helper()
+		removed, err := fs.RemoveMsg(seq)
+		if err != nil {
+			t.Fatalf("Got an error on remove of %d: %v", seq, err)
+		}
+		if !removed {
+			t.Fatalf("Expected remove to return true for %d", seq)
+		}
+		if state := fs.State(); state.Msgs != expectedMsgs {
+			t.Fatalf("Expected %d msgs, got %d", expectedMsgs, state.Msgs)
+		}
+	}
+
+	// Remove first
+	remove(1, 4)
+	// Remove last
+	remove(5, 3)
+	// Remove a middle
+	remove(3, 2)
 }
 
 func TestFileStoreMsgHeaders(t *testing.T) {
@@ -201,6 +223,235 @@ func TestFileStoreBasicWriteMsgsAndRestore(t *testing.T) {
 	}
 	if state.Bytes != expectedSize*2 {
 		t.Fatalf("Expected %d bytes, got %d", expectedSize*2, state.Bytes)
+	}
+
+	fs.Purge()
+	fs.Stop()
+
+	fs, err = newFileStore(fcfg, StreamConfig{Name: "dlc", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	state = fs.State()
+	if state.Msgs != 0 {
+		t.Fatalf("Expected %d msgs, got %d", 0, state.Msgs)
+	}
+	if state.Bytes != 0 {
+		t.Fatalf("Expected %d bytes, got %d", 0, state.Bytes)
+	}
+
+	seq, _, err := fs.StoreMsg(subj, nil, []byte("Hello"))
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	fs.RemoveMsg(seq)
+
+	fs.Stop()
+	fs, err = newFileStore(fcfg, StreamConfig{Name: "dlc", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	state = fs.State()
+	if state.FirstSeq != seq+1 {
+		t.Fatalf("Expected first seq to be %d, got %d", seq+1, state.FirstSeq)
+	}
+}
+
+func TestFileStoreSelectNextFirst(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	numMsgs := 10
+	subj, msg := "zzz", []byte("Hello World")
+	for i := 0; i < numMsgs; i++ {
+		fs.StoreMsg(subj, nil, msg)
+	}
+	if state := fs.State(); state.Msgs != uint64(numMsgs) {
+		t.Fatalf("Expected %d msgs, got %d", numMsgs, state.Msgs)
+	}
+
+	// Note the 256 block size is tied to the msg size below to give us 5 messages per block.
+	if fmb := fs.selectMsgBlock(1); fmb.msgs != 5 {
+		t.Fatalf("Expected 5 messages per block, but got %d", fmb.msgs)
+	}
+
+	// Delete 2-7, this will cross message blocks.
+	for i := 2; i <= 7; i++ {
+		fs.RemoveMsg(uint64(i))
+	}
+
+	if state := fs.State(); state.Msgs != 4 || state.FirstSeq != 1 {
+		t.Fatalf("Expected 4 msgs, first seq of 11, got msgs of %d and first seq of %d", state.Msgs, state.FirstSeq)
+	}
+	// Now close the gap which will force the system to jump underlying message blocks to find the right sequence.
+	fs.RemoveMsg(1)
+	if state := fs.State(); state.Msgs != 3 || state.FirstSeq != 8 {
+		t.Fatalf("Expected 3 msgs, first seq of 8, got msgs of %d and first seq of %d", state.Msgs, state.FirstSeq)
+	}
+}
+
+func TestFileStoreSkipMsg(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	numSkips := 10
+	for i := 0; i < numSkips; i++ {
+		fs.SkipMsg()
+	}
+	state := fs.State()
+	if state.Msgs != 0 {
+		t.Fatalf("Expected %d msgs, got %d", 0, state.Msgs)
+	}
+	if state.FirstSeq != uint64(numSkips+1) || state.LastSeq != uint64(numSkips) {
+		t.Fatalf("Expected first to be %d and last to be %d. got first %d and last %d", numSkips+1, numSkips, state.FirstSeq, state.LastSeq)
+	}
+
+	fs.StoreMsg("zzz", nil, []byte("Hello World!"))
+	fs.SkipMsg()
+	fs.SkipMsg()
+	fs.StoreMsg("zzz", nil, []byte("Hello World!"))
+	fs.SkipMsg()
+
+	state = fs.State()
+	if state.Msgs != 2 {
+		t.Fatalf("Expected %d msgs, got %d", 2, state.Msgs)
+	}
+	if state.FirstSeq != uint64(numSkips+1) || state.LastSeq != uint64(numSkips+5) {
+		t.Fatalf("Expected first to be %d and last to be %d. got first %d and last %d", numSkips+1, numSkips+5, state.FirstSeq, state.LastSeq)
+	}
+
+	// Make sure we recover same state.
+	fs.Stop()
+
+	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	state = fs.State()
+	if state.Msgs != 2 {
+		t.Fatalf("Expected %d msgs, got %d", 2, state.Msgs)
+	}
+	if state.FirstSeq != uint64(numSkips+1) || state.LastSeq != uint64(numSkips+5) {
+		t.Fatalf("Expected first to be %d and last to be %d. got first %d and last %d", numSkips+1, numSkips+5, state.FirstSeq, state.LastSeq)
+	}
+
+	subj, _, msg, _, err := fs.LoadMsg(11)
+	if err != nil {
+		t.Fatalf("Unexpected error looking up seq 11: %v", err)
+	}
+	if subj != "zzz" || string(msg) != "Hello World!" {
+		t.Fatalf("Message did not match")
+	}
+
+	fs.SkipMsg()
+	nseq, _, err := fs.StoreMsg("AAA", nil, []byte("Skip?"))
+	if err != nil {
+		t.Fatalf("Unexpected error looking up seq 11: %v", err)
+	}
+	if nseq != 17 {
+		t.Fatalf("Expected seq of %d but got %d", 17, nseq)
+	}
+
+	// Make sure we recover same state.
+	fs.Stop()
+
+	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	subj, _, msg, _, err = fs.LoadMsg(nseq)
+	if err != nil {
+		t.Fatalf("Unexpected error looking up seq %d: %v", nseq, err)
+	}
+	if subj != "AAA" || string(msg) != "Skip?" {
+		t.Fatalf("Message did not match")
+	}
+}
+
+func TestFileStoreWriteExpireWrite(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	cexp := 10 * time.Millisecond
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 256, CacheExpire: cexp},
+		StreamConfig{Name: "zzz", Storage: FileStorage},
+	)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	toSend := 10
+	for i := 0; i < toSend; i++ {
+		fs.StoreMsg("zzz", nil, []byte("Hello World!"))
+	}
+
+	// Wait for write cache portion to go to zero.
+	checkFor(t, time.Second, 20*time.Millisecond, func() error {
+		if csz := fs.cacheSize(); csz != 0 {
+			return fmt.Errorf("cache size not 0, got %s", FriendlyBytes(int64(csz)))
+		}
+		return nil
+	})
+
+	for i := 0; i < toSend; i++ {
+		fs.StoreMsg("zzz", nil, []byte("Hello World! - 22"))
+	}
+
+	if state := fs.State(); state.Msgs != uint64(toSend*2) {
+		t.Fatalf("Expected %d msgs, got %d", toSend*2, state.Msgs)
+	}
+
+	// Make sure we recover same state.
+	fs.Stop()
+
+	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	if state := fs.State(); state.Msgs != uint64(toSend*2) {
+		t.Fatalf("Expected %d msgs, got %d", toSend*2, state.Msgs)
+	}
+
+	// Now load them in and check.
+	for i := 1; i <= toSend*2; i++ {
+		subj, _, msg, _, err := fs.LoadMsg(uint64(i))
+		if err != nil {
+			t.Fatalf("Unexpected error looking up seq 11: %v", err)
+		}
+		str := "Hello World!"
+		if i > toSend {
+			str = "Hello World! - 22"
+		}
+		if subj != "zzz" || string(msg) != str {
+			t.Fatalf("Message did not match")
+		}
 	}
 }
 
@@ -360,7 +611,7 @@ func TestFileStoreTimeStamps(t *testing.T) {
 	for seq := uint64(1); seq <= 10; seq++ {
 		_, _, _, ts, err := fs.LoadMsg(seq)
 		if err != nil {
-			t.Fatalf("Unexpected error looking up msg: %v", err)
+			t.Fatalf("Unexpected error looking up msg [%d]: %v", seq, err)
 		}
 		// These should be different
 		if ts <= last {
@@ -488,6 +739,40 @@ func TestFileStorePurge(t *testing.T) {
 	})
 }
 
+func TestFileStoreCompact(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	subj, msg := "foo", []byte("Hello World")
+	for i := 0; i < 10; i++ {
+		fs.StoreMsg(subj, nil, msg)
+	}
+	if state := fs.State(); state.Msgs != 10 {
+		t.Fatalf("Expected 10 msgs, got %d", state.Msgs)
+	}
+	n, err := fs.Compact(6)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if n != 5 {
+		t.Fatalf("Expected to have purged 5 msgs, got %d", n)
+	}
+	state := fs.State()
+	if state.Msgs != 5 {
+		t.Fatalf("Expected 5 msgs, got %d", state.Msgs)
+	}
+	if state.FirstSeq != 6 {
+		t.Fatalf("Expected first seq of 6, got %d", state.FirstSeq)
+	}
+}
+
 func TestFileStoreRemovePartialRecovery(t *testing.T) {
 	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
 	os.MkdirAll(storeDir, 0755)
@@ -587,7 +872,7 @@ func TestFileStoreRemoveOutOfOrderRecovery(t *testing.T) {
 
 	state2 := fs.State()
 	if state != state2 {
-		t.Fatalf("Expected receovered states to be the same, got %+v vs %+v\n", state, state2)
+		t.Fatalf("Expected recovered states to be the same, got %+v vs %+v\n", state, state2)
 	}
 
 	if _, _, _, _, err := fs.LoadMsg(1); err != nil {
@@ -608,7 +893,7 @@ func TestFileStoreAgeLimitRecovery(t *testing.T) {
 	defer os.RemoveAll(storeDir)
 
 	fs, err := newFileStore(
-		FileStoreConfig{StoreDir: storeDir, ReadCacheExpire: 1 * time.Millisecond},
+		FileStoreConfig{StoreDir: storeDir, CacheExpire: 1 * time.Millisecond},
 		StreamConfig{Name: "zzz", Storage: FileStorage, MaxAge: maxAge},
 	)
 	if err != nil {
@@ -636,6 +921,7 @@ func TestFileStoreAgeLimitRecovery(t *testing.T) {
 
 	// Make sure they expire.
 	checkFor(t, time.Second, 2*maxAge, func() error {
+		t.Helper()
 		state = fs.State()
 		if state.Msgs != 0 {
 			return fmt.Errorf("Expected no msgs, got %d", state.Msgs)
@@ -722,6 +1008,7 @@ func TestFileStoreEraseMsg(t *testing.T) {
 
 	subj, msg := "foo", []byte("Hello World")
 	fs.StoreMsg(subj, nil, msg)
+	fs.StoreMsg(subj, nil, msg) // To keep block from being deleted.
 	_, _, smsg, _, err := fs.LoadMsg(1)
 	if err != nil {
 		t.Fatalf("Unexpected error looking up msg: %v", err)
@@ -731,22 +1018,23 @@ func TestFileStoreEraseMsg(t *testing.T) {
 	}
 	// Hold for offset check later.
 	sm, _ := fs.msgForSeq(1)
-
 	if removed, _ := fs.EraseMsg(1); !removed {
 		t.Fatalf("Expected erase msg to return success")
 	}
 	if sm2, _ := fs.msgForSeq(1); sm2 != nil {
 		t.Fatalf("Expected msg to be erased")
 	}
+	fs.checkAndFlushAllBlocks()
 
 	// Now look on disk as well.
 	rl := fileStoreMsgSize(subj, nil, msg)
 	buf := make([]byte, rl)
 	fp, err := os.Open(path.Join(storeDir, msgDir, fmt.Sprintf(blkScan, 1)))
 	if err != nil {
-		t.Fatalf("Error opening msgs file: %v", err)
+		t.Fatalf("Error opening msg block file: %v", err)
 	}
 	defer fp.Close()
+
 	fp.ReadAt(buf, sm.off)
 	nsubj, _, nmsg, seq, ts, err := msgFromBuf(buf, nil)
 	if err != nil {
@@ -755,7 +1043,7 @@ func TestFileStoreEraseMsg(t *testing.T) {
 	if nsubj == subj {
 		t.Fatalf("Expected the subjects to be different")
 	}
-	if seq != 0 {
+	if seq != 0 && seq&ebit == 0 {
 		t.Fatalf("Expected seq to be 0, marking as deleted, got %d", seq)
 	}
 	if ts != 0 {
@@ -1065,7 +1353,7 @@ func TestFileStoreReadCache(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, ReadCacheExpire: 50 * time.Millisecond}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, CacheExpire: 100 * time.Millisecond}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1077,6 +1365,14 @@ func TestFileStoreReadCache(t *testing.T) {
 	for i := 0; i < toStore; i++ {
 		fs.StoreMsg(subj, nil, msg)
 	}
+
+	// Wait for cache to go to zero.
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if csz := fs.cacheSize(); csz != 0 {
+			return fmt.Errorf("cache size not 0, got %s", FriendlyBytes(int64(csz)))
+		}
+		return nil
+	})
 
 	fs.LoadMsg(1)
 	if csz := fs.cacheSize(); csz != totalBytes {
@@ -1101,6 +1397,80 @@ func TestFileStoreReadCache(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 		fs.LoadMsg(1) // register activity.
+	}
+}
+
+func TestFileStorePartialCacheExpiration(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	cexp := 10 * time.Millisecond
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, CacheExpire: cexp}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	fs.StoreMsg("foo", nil, []byte("msg1"))
+
+	// Should expire and be removed.
+	time.Sleep(2 * cexp)
+	fs.StoreMsg("bar", nil, []byte("msg2"))
+
+	// Again wait for cache to expire.
+	time.Sleep(2 * cexp)
+	if _, _, _, _, err := fs.LoadMsg(1); err != nil {
+		t.Fatalf("Error loading message 1: %v", err)
+	}
+}
+
+func TestFileStorePartialIndexes(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	cexp := 10 * time.Millisecond
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, CacheExpire: cexp}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	toSend := 5
+	for i := 0; i < toSend; i++ {
+		fs.StoreMsg("foo", nil, []byte("ok-1"))
+	}
+
+	// Now wait til the cache expires, including the index.
+	fs.mu.Lock()
+	mb := fs.blks[0]
+	fs.mu.Unlock()
+
+	// Force idx to expire by resetting last remove ts.
+	mb.mu.Lock()
+	mb.lrts = mb.lrts - int64(defaultCacheIdxExpiration*2)
+	mb.mu.Unlock()
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		mb.mu.Lock()
+		defer mb.mu.Unlock()
+		if mb.cache == nil || len(mb.cache.idx) == 0 {
+			return nil
+		}
+		return fmt.Errorf("Index not empty")
+	})
+
+	// Create a partial cache by adding more msgs.
+	for i := 0; i < toSend; i++ {
+		fs.StoreMsg("foo", nil, []byte("ok-2"))
+	}
+	// If we now load in a message in second half if we do not
+	// detect idx is a partial correctly this will panic.
+	if _, _, _, _, err := fs.LoadMsg(8); err != nil {
+		t.Fatalf("Error loading %d: %v", 1, err)
 	}
 }
 
@@ -1135,16 +1505,16 @@ func TestFileStoreSnapshot(t *testing.T) {
 		t.Fatalf("Unexepected error: %v", err)
 	}
 	state := &ConsumerState{}
-	state.Delivered.ConsumerSeq = 100
-	state.Delivered.StreamSeq = 100
-	state.AckFloor.ConsumerSeq = 22
-	state.AckFloor.StreamSeq = 22
+	state.Delivered.Consumer = 100
+	state.Delivered.Stream = 100
+	state.AckFloor.Consumer = 22
+	state.AckFloor.Stream = 22
 
 	if err := o1.Update(state); err != nil {
 		t.Fatalf("Unexepected error updating state: %v", err)
 	}
-	state.AckFloor.ConsumerSeq = 33
-	state.AckFloor.StreamSeq = 33
+	state.AckFloor.Consumer = 33
+	state.AckFloor.Stream = 33
 
 	if err := o2.Update(state); err != nil {
 		t.Fatalf("Unexepected error updating state: %v", err)
@@ -1327,47 +1697,47 @@ func TestFileStoreConsumer(t *testing.T) {
 		}
 	}
 
-	state.Delivered.ConsumerSeq = 1
-	state.Delivered.StreamSeq = 22
+	state.Delivered.Consumer = 1
+	state.Delivered.Stream = 22
 	updateAndCheck()
 
-	state.Delivered.ConsumerSeq = 100
-	state.Delivered.StreamSeq = 122
-	state.AckFloor.ConsumerSeq = 50
-	state.AckFloor.StreamSeq = 123
+	state.Delivered.Consumer = 100
+	state.Delivered.Stream = 122
+	state.AckFloor.Consumer = 50
+	state.AckFloor.Stream = 123
 	// This should fail, bad state.
 	shouldFail()
 	// So should this.
-	state.AckFloor.ConsumerSeq = 200
-	state.AckFloor.StreamSeq = 100
+	state.AckFloor.Consumer = 200
+	state.AckFloor.Stream = 100
 	shouldFail()
 
 	// Should succeed
-	state.AckFloor.ConsumerSeq = 50
-	state.AckFloor.StreamSeq = 72
+	state.AckFloor.Consumer = 50
+	state.AckFloor.Stream = 72
 	updateAndCheck()
 
 	tn := time.Now().UnixNano()
 
 	// We should sanity check pending here as well, so will check if a pending value is below
 	// ack floor or above delivered.
-	state.Pending = map[uint64]int64{70: tn}
+	state.Pending = map[uint64]*Pending{70: &Pending{70, tn}}
 	shouldFail()
-	state.Pending = map[uint64]int64{140: tn}
+	state.Pending = map[uint64]*Pending{140: &Pending{140, tn}}
 	shouldFail()
-	state.Pending = map[uint64]int64{72: tn} // exact on floor should fail
+	state.Pending = map[uint64]*Pending{72: &Pending{72, tn}} // exact on floor should fail
 	shouldFail()
 
 	// Put timestamps a second apart.
 	// We will downsample to second resolution to save space. So setup our times
 	// to reflect that.
 	ago := time.Now().Add(-30 * time.Second).Truncate(time.Second)
-	nt := func() int64 {
+	nt := func() *Pending {
 		ago = ago.Add(time.Second)
-		return ago.UnixNano()
+		return &Pending{0, ago.UnixNano()}
 	}
 	// Should succeed.
-	state.Pending = map[uint64]int64{75: nt(), 80: nt(), 83: nt(), 90: nt(), 111: nt()}
+	state.Pending = map[uint64]*Pending{75: nt(), 80: nt(), 83: nt(), 90: nt(), 111: nt()}
 	updateAndCheck()
 
 	// Now do redlivery, but first with no pending.
@@ -1376,16 +1746,16 @@ func TestFileStoreConsumer(t *testing.T) {
 	updateAndCheck()
 
 	// All together.
-	state.Pending = map[uint64]int64{75: nt(), 80: nt(), 83: nt(), 90: nt(), 111: nt()}
+	state.Pending = map[uint64]*Pending{75: nt(), 80: nt(), 83: nt(), 90: nt(), 111: nt()}
 	updateAndCheck()
 
 	// Large one
-	state.Delivered.ConsumerSeq = 10000
-	state.Delivered.StreamSeq = 10000
-	state.AckFloor.ConsumerSeq = 100
-	state.AckFloor.StreamSeq = 100
+	state.Delivered.Consumer = 10000
+	state.Delivered.Stream = 10000
+	state.AckFloor.Consumer = 100
+	state.AckFloor.Stream = 100
 	// Generate 8k pending.
-	state.Pending = make(map[uint64]int64)
+	state.Pending = make(map[uint64]*Pending)
 	for len(state.Pending) < 8192 {
 		seq := uint64(rand.Intn(9890) + 101)
 		if _, ok := state.Pending[seq]; !ok {
@@ -1395,8 +1765,8 @@ func TestFileStoreConsumer(t *testing.T) {
 	updateAndCheck()
 
 	state.Pending = nil
-	state.AckFloor.ConsumerSeq = 10000
-	state.AckFloor.StreamSeq = 10000
+	state.AckFloor.Consumer = 10000
+	state.AckFloor.Stream = 10000
 	updateAndCheck()
 }
 
@@ -1593,14 +1963,108 @@ func TestFileStoreReadBackMsgPerf(t *testing.T) {
 	fmt.Printf("Time to load second msg [%d] = %v\n", index+2, time.Since(start))
 }
 
-func TestFileStoreConsumerPerf(t *testing.T) {
+// This test is testing an upper level stream with a message or byte limit.
+// Even though this is 1, any limit would trigger same behavior once the limit was reached
+// and we were adding and removing.
+func TestFileStoreStoreLimitRemovePerf(t *testing.T) {
 	// Comment out to run, holding place for now.
 	t.SkipNow()
+
+	subj, msg := "foo", make([]byte, 1024-33)
+	for i := 0; i < len(msg); i++ {
+		msg[i] = 'D'
+	}
+	storedMsgSize := fileStoreMsgSize(subj, nil, msg)
+
+	// 1GB
+	toStore := 1 * 1024 * 1024 * 1024 / storedMsgSize
 
 	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
-	fmt.Printf("StoreDir is %q\n", storeDir)
+
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir},
+		StreamConfig{Name: "zzz", Storage: FileStorage},
+	)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	fs.RegisterStorageUpdates(func(md, bd int64, seq uint64, subj string) {})
+
+	fmt.Printf("storing and removing (limit 1) %d msgs of %s each, totalling %s\n",
+		toStore,
+		FriendlyBytes(int64(storedMsgSize)),
+		FriendlyBytes(int64(toStore*storedMsgSize)),
+	)
+
+	start := time.Now()
+	for i := 0; i < int(toStore); i++ {
+		seq, _, err := fs.StoreMsg(subj, nil, msg)
+		if err != nil {
+			t.Fatalf("Unexpected error storing message: %v", err)
+		}
+		if i > 0 {
+			fs.RemoveMsg(seq - 1)
+		}
+	}
+	fs.Stop()
+
+	tt := time.Since(start)
+	fmt.Printf("time to store and remove all messages is %v\n", tt)
+	fmt.Printf("%.0f msgs/sec\n", float64(toStore)/tt.Seconds())
+	fmt.Printf("%s per sec\n", FriendlyBytes(int64(float64(toStore*storedMsgSize)/tt.Seconds())))
+}
+
+func TestFileStorePubPerfWithSmallBlkSize(t *testing.T) {
+	// Comment out to run, holding place for now.
+	t.SkipNow()
+
+	subj, msg := "foo", make([]byte, 1024-33)
+	for i := 0; i < len(msg); i++ {
+		msg[i] = 'D'
+	}
+	storedMsgSize := fileStoreMsgSize(subj, nil, msg)
+
+	// 1GB
+	toStore := 1 * 1024 * 1024 * 1024 / storedMsgSize
+
+	fmt.Printf("storing %d msgs of %s each, totalling %s\n",
+		toStore,
+		FriendlyBytes(int64(storedMsgSize)),
+		FriendlyBytes(int64(toStore*storedMsgSize)),
+	)
+
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: FileStoreMinBlkSize},
+		StreamConfig{Name: "zzz", Storage: FileStorage},
+	)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	start := time.Now()
+	for i := 0; i < int(toStore); i++ {
+		fs.StoreMsg(subj, nil, msg)
+	}
+	fs.Stop()
+
+	tt := time.Since(start)
+	fmt.Printf("time to store is %v\n", tt)
+	fmt.Printf("%.0f msgs/sec\n", float64(toStore)/tt.Seconds())
+	fmt.Printf("%s per sec\n", FriendlyBytes(int64(float64(toStore*storedMsgSize)/tt.Seconds())))
+}
+
+// Saw this manifest from a restart test with max delivered set for JetStream.
+func TestFileStoreConsumerRedeliveredLost(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
 
 	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
@@ -1608,53 +2072,341 @@ func TestFileStoreConsumerPerf(t *testing.T) {
 	}
 	defer fs.Stop()
 
-	// Test Consumers.
-	o, err := fs.ConsumerStore("obs22", &ConsumerConfig{})
+	cfg := &ConsumerConfig{AckPolicy: AckExplicit}
+	o, err := fs.ConsumerStore("o22", cfg)
 	if err != nil {
 		t.Fatalf("Unexepected error: %v", err)
 	}
-	state := &ConsumerState{}
-	toStore := uint64(1000000)
-	fmt.Printf("consumer of %d msgs for ACK NONE\n", toStore)
+
+	restartConsumer := func() {
+		t.Helper()
+		o.Stop()
+		o, err = fs.ConsumerStore("o22", cfg)
+		if err != nil {
+			t.Fatalf("Unexepected error: %v", err)
+		}
+		// Make sure we recovered Redelivered.
+		state, err := o.State()
+		if err != nil {
+			t.Fatalf("Unexepected error: %v", err)
+		}
+		if len(state.Redelivered) == 0 {
+			t.Fatalf("Did not recover redelivered")
+		}
+	}
+
+	ts := time.Now().UnixNano()
+	o.UpdateDelivered(1, 1, 1, ts)
+	o.UpdateDelivered(2, 1, 2, ts)
+	o.UpdateDelivered(3, 1, 3, ts)
+	o.UpdateDelivered(4, 1, 4, ts)
+	o.UpdateDelivered(5, 2, 1, ts)
+
+	restartConsumer()
+
+	o.UpdateDelivered(6, 2, 2, ts)
+	o.UpdateDelivered(7, 3, 1, ts)
+
+	restartConsumer()
+	if state, _ := o.State(); len(state.Pending) != 3 {
+		t.Fatalf("Did not recover pending correctly")
+	}
+
+	o.UpdateAcks(7, 3)
+	o.UpdateAcks(6, 2)
+
+	restartConsumer()
+	o.UpdateAcks(4, 1)
+
+	state, _ := o.State()
+	if len(state.Pending) != 0 {
+		t.Fatalf("Did not clear pending correctly")
+	}
+	if len(state.Redelivered) != 0 {
+		fmt.Printf("redelivered is %+v\n", state.Redelivered)
+		t.Fatalf("Did not clear redelivered correctly")
+	}
+}
+
+func TestFileStoreConsumerFlusher(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	o, err := fs.ConsumerStore("o22", &ConsumerConfig{})
+	if err != nil {
+		t.Fatalf("Unexepected error: %v", err)
+	}
+	// Get the underlying impl.
+	oc := o.(*consumerFileStore)
+	// Wait for flusher to be running.
+	checkFor(t, time.Second, 20*time.Millisecond, func() error {
+		if !oc.inFlusher() {
+			return fmt.Errorf("Flusher not running")
+		}
+		return nil
+	})
+	// Stop and make sure the flusher goes away
+	o.Stop()
+	// Wait for flusher to stop.
+	checkFor(t, time.Second, 20*time.Millisecond, func() error {
+		if oc.inFlusher() {
+			return fmt.Errorf("Flusher still running")
+		}
+		return nil
+	})
+}
+
+func TestFileStoreConsumerDeliveredUpdates(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	// Simple consumer, no ack policy configured.
+	o, err := fs.ConsumerStore("o22", &ConsumerConfig{})
+	if err != nil {
+		t.Fatalf("Unexepected error: %v", err)
+	}
+	defer o.Stop()
+
+	testDelivered := func(dseq, sseq uint64) {
+		t.Helper()
+		ts := time.Now().UnixNano()
+		if err := o.UpdateDelivered(dseq, sseq, 1, ts); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		state, err := o.State()
+		if err != nil {
+			t.Fatalf("Error getting state: %v", err)
+		}
+		if state == nil {
+			t.Fatalf("No state available")
+		}
+		expected := SequencePair{dseq, sseq}
+		if state.Delivered != expected {
+			t.Fatalf("Unexpected state, wanted %+v, got %+v", expected, state.Delivered)
+		}
+		if state.AckFloor != expected {
+			t.Fatalf("Unexpected ack floor state, wanted %+v, got %+v", expected, state.AckFloor)
+		}
+		if len(state.Pending) != 0 {
+			t.Fatalf("Did not expect any pending, got %d pending", len(state.Pending))
+		}
+	}
+
+	testDelivered(1, 100)
+	testDelivered(2, 110)
+	testDelivered(5, 130)
+
+	// If we try to do an ack this should err since we are not configured with ack policy.
+	if err := o.UpdateAcks(1, 100); err != ErrNoAckPolicy {
+		t.Fatalf("Expected a no ack policy error on update acks, got %v", err)
+	}
+	// Also if we do an update with a delivery count of anything but 1 here should also give same error.
+	ts := time.Now().UnixNano()
+	if err := o.UpdateDelivered(5, 130, 2, ts); err != ErrNoAckPolicy {
+		t.Fatalf("Expected a no ack policy error on update delivered with dc > 1, got %v", err)
+	}
+}
+
+func TestFileStoreConsumerDeliveredAndAckUpdates(t *testing.T) {
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	// Simple consumer, no ack policy configured.
+	o, err := fs.ConsumerStore("o22", &ConsumerConfig{AckPolicy: AckExplicit})
+	if err != nil {
+		t.Fatalf("Unexepected error: %v", err)
+	}
+	defer o.Stop()
+
+	// Track pending.
+	var pending int
+
+	testDelivered := func(dseq, sseq uint64) {
+		t.Helper()
+		ts := time.Now().Round(time.Second).UnixNano()
+		if err := o.UpdateDelivered(dseq, sseq, 1, ts); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		pending++
+		state, err := o.State()
+		if err != nil {
+			t.Fatalf("Error getting state: %v", err)
+		}
+		if state == nil {
+			t.Fatalf("No state available")
+		}
+		expected := SequencePair{dseq, sseq}
+		if state.Delivered != expected {
+			t.Fatalf("Unexpected delivered state, wanted %+v, got %+v", expected, state.Delivered)
+		}
+		if len(state.Pending) != pending {
+			t.Fatalf("Expected %d pending, got %d pending", pending, len(state.Pending))
+		}
+	}
+
+	testDelivered(1, 100)
+	testDelivered(2, 110)
+	testDelivered(3, 130)
+	testDelivered(4, 150)
+	testDelivered(5, 165)
+
+	testBadAck := func(dseq, sseq uint64) {
+		t.Helper()
+		if err := o.UpdateAcks(dseq, sseq); err == nil {
+			t.Fatalf("Expected error but got none")
+		}
+	}
+	testBadAck(3, 101)
+	testBadAck(1, 1)
+
+	testAck := func(dseq, sseq, dflr, sflr uint64) {
+		t.Helper()
+		if err := o.UpdateAcks(dseq, sseq); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		pending--
+		state, err := o.State()
+		if err != nil {
+			t.Fatalf("Error getting state: %v", err)
+		}
+		if state == nil {
+			t.Fatalf("No state available")
+		}
+		if len(state.Pending) != pending {
+			t.Fatalf("Expected %d pending, got %d pending", pending, len(state.Pending))
+		}
+		eflr := SequencePair{dflr, sflr}
+		if state.AckFloor != eflr {
+			t.Fatalf("Unexpected ack floor state, wanted %+v, got %+v", eflr, state.AckFloor)
+		}
+	}
+
+	testAck(1, 100, 1, 100)
+	testAck(3, 130, 1, 100)
+	testAck(2, 110, 3, 149) // We do not track explicit state on previous stream floors, so we take last known -1
+	testAck(5, 165, 3, 149)
+	testAck(4, 150, 5, 165)
+
+	testDelivered(6, 170)
+	testDelivered(7, 171)
+	testDelivered(8, 172)
+	testDelivered(9, 173)
+	testDelivered(10, 200)
+
+	testAck(7, 171, 5, 165)
+	testAck(8, 172, 5, 165)
+
+	state, err := o.State()
+	if err != nil {
+		t.Fatalf("Unexpected error getting state: %v", err)
+	}
+	o.Stop()
+
+	o, err = fs.ConsumerStore("o22", &ConsumerConfig{AckPolicy: AckExplicit})
+	if err != nil {
+		t.Fatalf("Unexepected error: %v", err)
+	}
+	defer o.Stop()
+
+	nstate, err := o.State()
+	if err != nil {
+		t.Fatalf("Unexpected error getting state: %v", err)
+	}
+	if !reflect.DeepEqual(nstate, state) {
+		t.Fatalf("States don't match!")
+	}
+}
+
+func TestFileStoreConsumerPerf(t *testing.T) {
+	// Comment out to run, holding place for now.
+	t.SkipNow()
+
+	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
+	os.MkdirAll(storeDir, 0755)
+	defer os.RemoveAll(storeDir)
+
+	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	o, err := fs.ConsumerStore("o22", &ConsumerConfig{AckPolicy: AckExplicit})
+	if err != nil {
+		t.Fatalf("Unexepected error: %v", err)
+	}
+	// Get the underlying impl.
+	oc := o.(*consumerFileStore)
+	// Wait for flusher to br running
+	checkFor(t, time.Second, 20*time.Millisecond, func() error {
+		if !oc.inFlusher() {
+			return fmt.Errorf("not in flusher")
+		}
+		return nil
+	})
+
+	// Stop flusher for this benchmark since we will invoke directly.
+	oc.mu.Lock()
+	qch := oc.qch
+	oc.qch = nil
+	oc.mu.Unlock()
+	close(qch)
+
+	checkFor(t, time.Second, 20*time.Millisecond, func() error {
+		if oc.inFlusher() {
+			return fmt.Errorf("still in flusher")
+		}
+		return nil
+	})
+
+	toStore := uint64(1_000_000)
 
 	start := time.Now()
+
+	ts := start.UnixNano()
+
 	for i := uint64(1); i <= toStore; i++ {
-		state.Delivered.ConsumerSeq = i
-		state.Delivered.StreamSeq = i
-		state.AckFloor.ConsumerSeq = i
-		state.AckFloor.StreamSeq = i
-		if err := o.Update(state); err != nil {
-			t.Fatalf("Unexepected error updating state: %v", err)
+		if err := o.UpdateDelivered(i, i, 1, ts); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
 		}
 	}
 	tt := time.Since(start)
-	fmt.Printf("time is %v\n", tt)
+	fmt.Printf("time to update %d is %v\n", toStore, tt)
 	fmt.Printf("%.0f updates/sec\n", float64(toStore)/tt.Seconds())
-
-	// We will lag behind with pending.
-	state.Pending = make(map[uint64]int64)
-	lag := uint64(100)
-	state.AckFloor.ConsumerSeq = 0
-	state.AckFloor.StreamSeq = 0
-
-	fmt.Printf("\nconsumer of %d msgs for ACK EXPLICIT with pending lag of %d\n", toStore, lag)
 
 	start = time.Now()
-	for i := uint64(1); i <= toStore; i++ {
-		state.Delivered.ConsumerSeq = i
-		state.Delivered.StreamSeq = i
-		state.Pending[i] = time.Now().UnixNano()
-		if i > lag {
-			ackseq := i - lag
-			state.AckFloor.ConsumerSeq = ackseq
-			state.AckFloor.StreamSeq = ackseq
-			delete(state.Pending, ackseq)
-		}
-		if err := o.Update(state); err != nil {
-			t.Fatalf("Unexepected error updating state: %v", err)
-		}
+	oc.mu.Lock()
+	buf, err := oc.encodeState()
+	oc.mu.Unlock()
+	if err != nil {
+		t.Fatalf("Error encoding state: %v", err)
 	}
-	tt = time.Since(start)
-	fmt.Printf("time is %v\n", tt)
-	fmt.Printf("%.0f updates/sec\n", float64(toStore)/tt.Seconds())
+	fmt.Printf("time to encode %d bytes is %v\n", len(buf), time.Since(start))
+	start = time.Now()
+	oc.writeState(buf)
+	fmt.Printf("time to write is %v\n", time.Since(start))
+	start = time.Now()
+	oc.syncStateFile()
+	fmt.Printf("time to sync is %v\n", time.Since(start))
 }

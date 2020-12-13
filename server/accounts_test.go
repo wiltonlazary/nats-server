@@ -661,7 +661,7 @@ func TestSimpleMapping(t *testing.T) {
 		}
 		matches := mraw[0]
 		if matches[SUB_INDEX] != "import.foo" {
-			t.Fatalf("Did not get correct subject: '%s'", matches[SUB_INDEX])
+			t.Fatalf("Did not get correct subject: wanted %q, got %q", "import.foo", matches[SUB_INDEX])
 		}
 		if matches[SID_INDEX] != sid {
 			t.Fatalf("Did not get correct sid: '%s'", matches[SID_INDEX])
@@ -1704,9 +1704,12 @@ func TestAccountTrackLatencyRemoteLeaks(t *testing.T) {
 
 	expectTracking := func(expected int) {
 		t.Helper()
-		if numTracking := tracking(); numTracking != expected {
-			t.Fatalf("Expected to have %d tracking replies, got %d", expected, numTracking)
-		}
+		checkFor(t, time.Second, 10*time.Millisecond, func() error {
+			if numTracking := tracking(); numTracking != expected {
+				return fmt.Errorf("Expected to have %d tracking replies, got %d", expected, numTracking)
+			}
+			return nil
+		})
 	}
 
 	expectTracking(2)

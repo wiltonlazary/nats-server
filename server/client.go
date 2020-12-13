@@ -51,6 +51,20 @@ const (
 	ACCOUNT
 )
 
+// Extended type of a CLIENT connection. This is returned by c.clientType()
+// and indicate what type of client connection we are dealing with.
+// If invoked on a non CLIENT connection, NON_CLIENT type is returned.
+const (
+	// If the connection is not a CLIENT connection.
+	NON_CLIENT = iota
+	// Regular NATS client.
+	NATS
+	// MQTT client.
+	MQTT
+	// Websocket client.
+	WS
+)
+
 const (
 	// ClientProtoZero is the original Client protocol from 2009.
 	// http://nats.io/documentation/internals/nats-protocol/
@@ -177,6 +191,8 @@ const (
 	MsgHeaderViolation
 	NoRespondersRequiresHeaders
 	ClusterNameConflict
+	DuplicateRemoteLeafnodeConnection
+	DuplicateClientID
 )
 
 // Some flags passed to processMsgResults
@@ -236,6 +252,7 @@ type client struct {
 	gw    *gateway
 	leaf  *leaf
 	ws    *websocket
+	mqtt  *mqtt
 
 	// To keep track of gateway replies mapping
 	gwrm map[string]*gwReplyMap
@@ -424,6 +441,26 @@ func (c *client) GetTLSConnectionState() *tls.ConnectionState {
 	return &state
 }
 
+// For CLIENT connections, this function returns the client type, that is,
+// NATS (for regular clients), MQTT or WS for websocket.
+// If this is invoked for a non CLIENT connection, NON_CLIENT is returned.
+//
+// This function does not lock the client and accesses fields that are supposed
+// to be immutable and therefore it can be invoked outside of the client's lock.
+func (c *client) clientType() int {
+	switch c.kind {
+	case CLIENT:
+		if c.isMqtt() {
+			return MQTT
+		} else if c.isWebsocket() {
+			return WS
+		}
+		return NATS
+	default:
+		return NON_CLIENT
+	}
+}
+
 // This is the main subscription struct that indicates
 // interest in published messages.
 // FIXME(dlc) - This is getting bloated for normal subs, need
@@ -441,6 +478,7 @@ type subscription struct {
 	max     int64
 	qw      int32
 	closed  int32
+	mqtt    *mqttSub
 }
 
 // Indicate that this subscription is closed.
@@ -536,11 +574,14 @@ func (c *client) initClient() {
 
 	switch c.kind {
 	case CLIENT:
-		name := "cid"
-		if c.ws != nil {
-			name = "wid"
+		switch c.clientType() {
+		case NATS:
+			c.ncs.Store(fmt.Sprintf("%s - cid:%d", conn, c.cid))
+		case WS:
+			c.ncs.Store(fmt.Sprintf("%s - wid:%d", conn, c.cid))
+		case MQTT:
+			c.ncs.Store(fmt.Sprintf("%s - mid:%d", conn, c.cid))
 		}
-		c.ncs.Store(fmt.Sprintf("%s - %s:%d", conn, name, c.cid))
 	case ROUTER:
 		c.ncs.Store(fmt.Sprintf("%s - rid:%d", conn, c.cid))
 	case GATEWAY:
@@ -962,7 +1003,10 @@ func (c *client) readLoop(pre []byte) {
 		return
 	}
 	nc := c.nc
-	ws := c.ws != nil
+	ws := c.isWebsocket()
+	if c.isMqtt() {
+		c.mqtt.r = &mqttReader{reader: nc}
+	}
 	c.in.rsz = startBufSize
 	// Snapshot max control line since currently can not be changed on reload and we
 	// were checking it on each call to parse. If this changes and we allow MaxControlLine
@@ -982,6 +1026,9 @@ func (c *client) readLoop(pre []byte) {
 	c.mu.Unlock()
 
 	defer func() {
+		if c.isMqtt() {
+			s.mqttHandleWill(c)
+		}
 		// These are used only in the readloop, so we can set them to nil
 		// on exit of the readLoop.
 		c.in.results, c.in.pacache = nil, nil
@@ -1143,7 +1190,7 @@ func closedStateForErr(err error) ClosedState {
 // collapsePtoNB will place primary onto nb buffer as needed in prep for WriteTo.
 // This will return a copy on purpose.
 func (c *client) collapsePtoNB() (net.Buffers, int64) {
-	if c.ws != nil {
+	if c.isWebsocket() {
 		return c.wsCollapsePtoNB()
 	}
 	if c.out.p != nil {
@@ -1157,7 +1204,7 @@ func (c *client) collapsePtoNB() (net.Buffers, int64) {
 // This will handle the fixup needed on a partial write.
 // Assume pending has been already calculated correctly.
 func (c *client) handlePartialWrite(pnb net.Buffers) {
-	if c.ws != nil {
+	if c.isWebsocket() {
 		c.ws.frames = append(pnb, c.ws.frames...)
 		return
 	}
@@ -1251,7 +1298,7 @@ func (c *client) flushOutbound() bool {
 
 	// Subtract from pending bytes and messages.
 	c.out.pb -= n
-	if c.ws != nil {
+	if c.isWebsocket() {
 		c.ws.fs -= n
 	}
 	c.out.pm -= apm // FIXME(dlc) - this will not be totally accurate on partials.
@@ -1370,7 +1417,7 @@ func (c *client) markConnAsClosed(reason ClosedState) {
 	c.flags.set(connMarkedClosed)
 	// For a websocket client, unless we are told not to flush, enqueue
 	// a websocket CloseMessage based on the reason.
-	if !skipFlush && c.ws != nil && !c.ws.closeSent {
+	if !skipFlush && c.isWebsocket() && !c.ws.closeSent {
 		c.wsEnqueueCloseMessage(reason)
 	}
 	// Be consistent with the creation: for routes and gateways,
@@ -1682,7 +1729,6 @@ func (c *client) processConnect(arg []byte) error {
 			// By default register with the global account.
 			c.registerWithAccount(srv.globalAccount())
 		}
-
 	}
 
 	switch kind {
@@ -1702,7 +1748,6 @@ func (c *client) processConnect(arg []byte) error {
 			c.sendErr(ErrNoRespondersRequiresHeaders.Error())
 			c.closeConnection(NoRespondersRequiresHeaders)
 			return ErrNoRespondersRequiresHeaders
-
 		}
 		if verbose {
 			c.sendOK()
@@ -1932,6 +1977,9 @@ func (c *client) sendRTTPing() bool {
 // the c.rtt is 0 and wants to force an update by sending a PING.
 // Client lock held on entry.
 func (c *client) sendRTTPingLocked() bool {
+	if c.isMqtt() {
+		return false
+	}
 	// Most client libs send a CONNECT+PING and wait for a PONG from the
 	// server. So if firstPongSent flag is set, it is ok for server to
 	// send the PING. But in case we have client libs that don't do that,
@@ -1962,7 +2010,7 @@ func (c *client) generateClientInfoJSON(info Info) []byte {
 	info.CID = c.cid
 	info.ClientIP = c.host
 	info.MaxPayload = c.mpay
-	if c.ws != nil {
+	if c.isWebsocket() {
 		info.ClientConnectURLs = info.WSConnectURLs
 	}
 	info.WSConnectURLs = nil
@@ -1977,7 +2025,9 @@ func (c *client) sendErr(err string) {
 	if c.trace {
 		c.traceOutOp("-ERR", []byte(err))
 	}
-	c.enqueueProto([]byte(fmt.Sprintf(errProto, err)))
+	if !c.isMqtt() {
+		c.enqueueProto([]byte(fmt.Sprintf(errProto, err)))
+	}
 	c.mu.Unlock()
 }
 
@@ -2253,7 +2303,7 @@ func (c *client) processSub(subject, queue, bsid []byte, cb msgHandler, noForwar
 	// This check does not apply to SYSTEM or JETSTREAM or ACCOUNT clients (because they don't have a `nc`...)
 	if c.isClosed() && (kind != SYSTEM && kind != JETSTREAM && kind != ACCOUNT) {
 		c.mu.Unlock()
-		return sub, nil
+		return nil, ErrConnectionClosed
 	}
 
 	// Check permissions if applicable.
@@ -2941,7 +2991,12 @@ func (c *client) deliverMsg(sub *subscription, subject, reply, mh, msg []byte, g
 	// Update statistics
 
 	// The msg includes the CR_LF, so pull back out for accounting.
-	msgSize := int64(len(msg) - LEN_CR_LF)
+	msgSize := int64(len(msg))
+	prodIsMQTT := c.isMqtt()
+	// MQTT producers send messages without CR_LF, so don't remove it for them.
+	if !prodIsMQTT {
+		msgSize -= int64(LEN_CR_LF)
+	}
 
 	// No atomic needed since accessed under client lock.
 	// Monitor is reading those also under client's lock.
@@ -2949,14 +3004,20 @@ func (c *client) deliverMsg(sub *subscription, subject, reply, mh, msg []byte, g
 	client.outBytes += msgSize
 
 	// Check for internal subscriptions.
-	if sub.icb != nil || client.kind == SYSTEM || client.kind == JETSTREAM || client.kind == ACCOUNT {
+	if sub.icb != nil {
+		if gwrply {
+			// Note that we keep track of the GW routed reply in the destination
+			// connection (`client`). The routed reply subject is in `c.pa.reply`,
+			// should that change, we would have to pass the GW routed reply as
+			// a parameter of deliverMsg().
+			srv.trackGWReply(client, c.pa.reply)
+		}
 		client.mu.Unlock()
-		// Internal account clients are for service imports and need the
-		// complete raw msg with '\r\n'.
+		// Internal account clients are for service imports and need the '\r\n'.
 		if client.kind == ACCOUNT {
-			sub.icb(sub, c, string(subject), string(c.pa.reply), msg)
+			sub.icb(sub, c, string(subject), string(reply), msg)
 		} else {
-			sub.icb(sub, c, string(subject), string(c.pa.reply), msg[:msgSize])
+			sub.icb(sub, c, string(subject), string(reply), msg[:msgSize])
 		}
 		return true
 	}
@@ -2988,9 +3049,10 @@ func (c *client) deliverMsg(sub *subscription, subject, reply, mh, msg []byte, g
 	// header (which is c.pa.reply without the GNR routing prefix).
 	if client.kind == CLIENT && len(c.pa.reply) > minReplyLen {
 		if gwrply {
-			// Note we keep track "in" the destination client (`client`) but the
-			// routed reply subject is in `c.pa.reply`. Should that change, we
-			// would have to pass the "reply" in deliverMsg().
+			// Note that we keep track of the GW routed reply in the destination
+			// connection (`client`). The routed reply subject is in `c.pa.reply`,
+			// should that change, we would have to pass the GW routed reply as
+			// a parameter of deliverMsg().
 			srv.trackGWReply(client, c.pa.reply)
 		}
 
@@ -3009,6 +3071,10 @@ func (c *client) deliverMsg(sub *subscription, subject, reply, mh, msg []byte, g
 	// Queue to outbound buffer
 	client.queueOutbound(mh)
 	client.queueOutbound(msg)
+	if prodIsMQTT {
+		// Need to add CR_LF since MQTT producers don't send CR_LF
+		client.queueOutbound([]byte(CR_LF))
+	}
 
 	client.out.pm++
 
@@ -3303,6 +3369,11 @@ func (c *client) processInboundClientMsg(msg []byte) bool {
 		c.sendOK()
 	}
 
+	// If MQTT client, check for retain flag now that we have passed permissions check
+	if c.isMqtt() {
+		c.mqttHandlePubRetain()
+	}
+
 	// Check if this client's gateway replies map is not empty
 	if atomic.LoadInt32(&c.cgwrt) > 0 && c.handleGWReplyMap(msg) {
 		return true
@@ -3378,6 +3449,7 @@ func (c *client) processInboundClientMsg(msg []byte) bool {
 			atomic.LoadInt64(&c.srv.gateway.totalQSubs) > 0 {
 			flag |= pmrCollectQueueNames
 		}
+
 		didDeliver, qnames = c.processMsgResults(c.acc, r, msg, c.pa.deliver, c.pa.subject, c.pa.reply, flag)
 	}
 
@@ -3501,8 +3573,7 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	// TODO(dlc) - restrict to configured service imports and not responses?
 	tracking, headers := shouldSample(si.latency, c)
 	if len(c.pa.reply) > 0 {
-		rsi = c.setupResponseServiceImport(acc, si, tracking, headers)
-		if rsi != nil {
+		if rsi = c.setupResponseServiceImport(acc, si, tracking, headers); rsi != nil {
 			nrr = []byte(rsi.from)
 		}
 	} else {
@@ -3516,6 +3587,8 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	// This is always a response.
 	var didSendTL bool
 	if si.tracking {
+		// Stamp that we attempted delivery.
+		si.didDeliver = true
 		didSendTL = acc.sendTrackingLatency(si, c)
 	}
 
@@ -3529,10 +3602,17 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	}
 
 	// Now check to see if this account has mappings that could affect the service import.
-	// Can't use non locked trick like in processInboundClientMsg, so just call into selectMappedSubject
+	// Can't use non-locked trick like in processInboundClientMsg, so just call into selectMappedSubject
 	// so we only lock once.
 	to, _ = si.acc.selectMappedSubject(to)
 
+	oreply, oacc := c.pa.reply, c.acc
+	c.pa.reply = nrr
+	if !si.isSysAcc {
+		c.mu.Lock()
+		c.acc = si.acc
+		c.mu.Unlock()
+	}
 	// FIXME(dlc) - Do L1 cache trick like normal client?
 	rr := si.acc.sl.Match(to)
 
@@ -3567,6 +3647,13 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 
 	// Put what was there back now.
 	c.in.rts = orts
+	c.pa.reply = oreply
+
+	if !si.isSysAcc {
+		c.mu.Lock()
+		c.acc = oacc
+		c.mu.Unlock()
+	}
 
 	// Determine if we should remove this service import. This is for response service imports.
 	// We will remove if we did not deliver, or if we are a response service import and we are
@@ -3704,8 +3791,10 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 			}
 			continue
 		}
-		// Assume delivery subject is normal subject to this point.
+
+		// Assume delivery subject is the normal subject to this point.
 		dsubj = subj
+
 		// Check for stream import mapped subs (shadow subs). These apply to local subs only.
 		if sub.im != nil {
 			// If this message was a service import do not re-export to an exported stream.
@@ -3713,14 +3802,26 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 				continue
 			}
 			if sub.im.tr != nil {
-				to, _ := sub.im.tr.transformSubject(string(subj))
+				to, _ := sub.im.tr.transformSubject(string(dsubj))
 				dsubj = append(_dsubj[:0], to...)
 			} else if sub.im.usePub {
 				dsubj = append(_dsubj[:0], subj...)
 			} else {
 				dsubj = append(_dsubj[:0], sub.im.to...)
 			}
+			// If we are mapping for a deliver subject we will reverse roles.
+			// The original subj we set from above is correct for the msg header,
+			// but we need to transform the deliver subject to properly route.
+			if len(deliver) > 0 {
+				dsubj, subj = subj, dsubj
+			}
 		}
+
+		// Remap to original if internal.
+		if sub.icb != nil {
+			subj = subject
+		}
+
 		// Normal delivery
 		mh := c.msgHeader(dsubj, creply, sub)
 		didDeliver = c.deliverMsg(sub, subj, creply, mh, msg, rplyHasGWPrefix) || didDeliver
@@ -3816,6 +3917,8 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 					continue
 				} else {
 					c.addSubToRouteTargets(sub)
+					// Clear rsub since we added a sub.
+					rsub = nil
 					if flags&pmrCollectQueueNames != 0 {
 						queues = append(queues, sub.queue)
 					}
@@ -3950,18 +4053,30 @@ func (c *client) processPingTimer() {
 
 	c.Debugf("%s Ping Timer", c.typeString())
 
+	var sendPing bool
+
 	// If we have had activity within the PingInterval then
 	// there is no need to send a ping. This can be client data
 	// or if we received a ping from the other side.
 	pingInterval := c.srv.getOpts().PingInterval
+	if c.kind == GATEWAY {
+		pingInterval = adjustPingIntervalForGateway(pingInterval)
+		sendPing = true
+	}
 	now := time.Now()
 	needRTT := c.rtt == 0 || now.Sub(c.rttStart) > DEFAULT_RTT_MEASUREMENT_INTERVAL
 
-	if delta := now.Sub(c.last); delta < pingInterval && !needRTT {
-		c.Debugf("Delaying PING due to client activity %v ago", delta.Round(time.Second))
-	} else if delta := now.Sub(c.ping.last); delta < pingInterval && !needRTT {
-		c.Debugf("Delaying PING due to remote ping %v ago", delta.Round(time.Second))
-	} else {
+	// Do not delay PINGs for GATEWAY connections.
+	if c.kind != GATEWAY {
+		if delta := now.Sub(c.last); delta < pingInterval && !needRTT {
+			c.Debugf("Delaying PING due to client activity %v ago", delta.Round(time.Second))
+		} else if delta := now.Sub(c.ping.last); delta < pingInterval && !needRTT {
+			c.Debugf("Delaying PING due to remote ping %v ago", delta.Round(time.Second))
+		} else {
+			sendPing = true
+		}
+	}
+	if sendPing {
 		// Check for violation
 		if c.ping.out+1 > c.srv.getOpts().MaxPingsOut {
 			c.Debugf("Stale Client Connection - Closing")
@@ -3979,12 +4094,24 @@ func (c *client) processPingTimer() {
 	c.mu.Unlock()
 }
 
+// Returns the smallest value between the given `d` and `gatewayMaxPingInterval` durations.
+// Invoked for connections known to be of GATEWAY type.
+func adjustPingIntervalForGateway(d time.Duration) time.Duration {
+	if d > gatewayMaxPingInterval {
+		return gatewayMaxPingInterval
+	}
+	return d
+}
+
 // Lock should be held
 func (c *client) setPingTimer() {
 	if c.srv == nil {
 		return
 	}
 	d := c.srv.getOpts().PingInterval
+	if c.kind == GATEWAY {
+		d = adjustPingIntervalForGateway(d)
+	}
 	c.ping.tmr = time.AfterFunc(d, c.processPingTimer)
 }
 
@@ -4532,7 +4659,7 @@ func convertAllowedConnectionTypes(cts []string) (map[string]struct{}, error) {
 	for _, i := range cts {
 		i = strings.ToUpper(i)
 		switch i {
-		case jwt.ConnectionTypeStandard, jwt.ConnectionTypeWebsocket, jwt.ConnectionTypeLeafnode:
+		case jwt.ConnectionTypeStandard, jwt.ConnectionTypeWebsocket, jwt.ConnectionTypeLeafnode, jwt.ConnectionTypeMqtt:
 			m[i] = struct{}{}
 		default:
 			unknown = append(unknown, i)
@@ -4554,14 +4681,19 @@ func (c *client) connectionTypeAllowed(acts map[string]struct{}) bool {
 	if len(acts) == 0 {
 		return true
 	}
-	// Assume standard client, then update based on presence of websocket
-	// or other type.
-	want := jwt.ConnectionTypeStandard
-	if c.kind == LEAF {
+	var want string
+	switch c.kind {
+	case CLIENT:
+		switch c.clientType() {
+		case NATS:
+			want = jwt.ConnectionTypeStandard
+		case WS:
+			want = jwt.ConnectionTypeWebsocket
+		case MQTT:
+			want = jwt.ConnectionTypeMqtt
+		}
+	case LEAF:
 		want = jwt.ConnectionTypeLeafnode
-	}
-	if c.ws != nil {
-		want = jwt.ConnectionTypeWebsocket
 	}
 	_, ok := acts[want]
 	return ok

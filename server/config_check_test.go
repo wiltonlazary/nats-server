@@ -361,6 +361,19 @@ func TestConfigCheck(t *testing.T) {
 			errorPos:  5,
 		},
 		{
+			name: "verify_cert_and_check_known_urls not support for clients",
+			config: `
+		tls = {
+						cert_file: "configs/certs/server.pem"
+						key_file: "configs/certs/key.pem"
+					    verify_cert_and_check_known_urls: true
+		}
+		`,
+			err:       errors.New("verify_cert_and_check_known_urls not supported in this context"),
+			errorLine: 5,
+			errorPos:  10,
+		},
+		{
 			name: "when unknown option is in cluster config with defined routes",
 			config: `
 		cluster {
@@ -1141,6 +1154,25 @@ func TestConfigCheck(t *testing.T) {
 			errorPos:  0,
 		},
 		{
+			name: "verify_cert_and_check_known_urls do not work for leaf nodes",
+			config: `
+		leafnodes {
+		  remotes = [
+		    {
+		      url: "tls://nats:7422"
+		      tls {
+		        timeout: 0.01
+				verify_cert_and_check_known_urls: true
+		      }
+		    }
+		  ]
+		}`,
+			//Unexpected error after processing config: /var/folders/9h/6g_c9l6n6bb8gp331d_9y0_w0000gn/T/057996446:8:5:
+			err:       errors.New("verify_cert_and_check_known_urls not supported in this context"),
+			errorLine: 8,
+			errorPos:  5,
+		},
+		{
 			name: "when leafnode remotes use wrong type",
 			config: `
 		leafnodes {
@@ -1163,32 +1195,6 @@ func TestConfigCheck(t *testing.T) {
 			err:       errors.New(`Expected remote leafnode url to be an array or string, got 1234`),
 			errorLine: 4,
 			errorPos:  18,
-		},
-		{
-			name: "when setting latency tracking without a system account",
-			config: `
-                accounts {
-                  sys { users = [ {user: sys, pass: "" } ] }
-
-                  nats.io: {
-                    users = [ { user : bar, pass: "" } ]
-
-                    exports = [
-                      { service: "nats.add"
-                        response: singleton
-                        latency: {
-                          sampling: 100%
-                          subject: "latency.tracking.add"
-                        }
-                      }
-
-                    ]
-                  }
-                }
-                `,
-			err:       errors.New(`Error adding service latency sampling for "nats.add": system account not setup`),
-			errorLine: 2,
-			errorPos:  17,
 		},
 		{
 			name: "when setting latency tracking with a system account",
@@ -1295,8 +1301,8 @@ func TestConfigCheck(t *testing.T) {
                      user: user1
                      password: pwd
                      users = [{user: user2, password: pwd}]
-									 }
-								}
+                   }
+                }
               `,
 			err:       errors.New("can not have a single user/pass and a users array"),
 			errorLine: 3,
@@ -1306,17 +1312,75 @@ func TestConfigCheck(t *testing.T) {
 			name: "duplicate usernames in leafnode authorization",
 			config: `
                 leafnodes {
-                   authorization {
-                     users = [
-                       {user: user, password: pwd}
-											 {user: user, password: pwd}
-                     ]
-									 }
-								}
+                    authorization {
+                        users = [
+                            {user: user, password: pwd}
+                            {user: user, password: pwd}
+                        ]
+                    }
+                }
               `,
 			err:       errors.New(`duplicate user "user" detected in leafnode authorization`),
 			errorLine: 3,
-			errorPos:  20,
+			errorPos:  21,
+		},
+		{
+			name: "mqtt bad type",
+			config: `
+                mqtt [
+					"wrong"
+				]
+			`,
+			err:       errors.New(`Expected mqtt to be a map, got []interface {}`),
+			errorLine: 2,
+			errorPos:  17,
+		},
+		{
+			name: "mqtt bad listen",
+			config: `
+                mqtt {
+                    listen: "xxxxxxxx"
+				}
+			`,
+			err:       errors.New(`could not parse address string "xxxxxxxx"`),
+			errorLine: 3,
+			errorPos:  21,
+		},
+		{
+			name: "mqtt bad host",
+			config: `
+                mqtt {
+                    host: 1234
+				}
+			`,
+			err:       errors.New(`interface conversion: interface {} is int64, not string`),
+			errorLine: 3,
+			errorPos:  21,
+		},
+		{
+			name: "mqtt bad port",
+			config: `
+                mqtt {
+                    port: "abc"
+				}
+			`,
+			err:       errors.New(`interface conversion: interface {} is string, not int64`),
+			errorLine: 3,
+			errorPos:  21,
+		},
+		{
+			name: "mqtt bad TLS",
+			config: `
+                mqtt {
+					port: -1
+                    tls {
+                        cert_file: "./configs/certs/server.pem"
+					}
+				}
+			`,
+			err:       errors.New(`missing 'key_file' in TLS configuration`),
+			errorLine: 4,
+			errorPos:  21,
 		},
 		{
 			name: "connection types wrong type",
@@ -1385,6 +1449,21 @@ func TestConfigCheck(t *testing.T) {
 			err:       fmt.Errorf("missing 'key_file' in TLS configuration"),
 			errorLine: 3,
 			errorPos:  21,
+		},
+		{
+			name: "verify_cert_and_check_known_urls not support for websockets",
+			config: `
+				websocket {
+                    tls {
+						cert_file: "configs/certs/server.pem"
+						key_file: "configs/certs/key.pem"
+					    verify_cert_and_check_known_urls: true
+					}
+				}
+			`,
+			err:       fmt.Errorf("verify_cert_and_check_known_urls not supported in this context"),
+			errorLine: 6,
+			errorPos:  10,
 		},
 	}
 

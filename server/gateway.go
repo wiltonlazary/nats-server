@@ -49,6 +49,10 @@ const (
 	gwClusterOffset  = gwReplyPrefixLen
 	gwServerOffset   = gwClusterOffset + gwHashLen + 1
 	gwSubjectOffset  = gwServerOffset + gwHashLen + 1
+
+	// Gateway connections send PINGs regardless of traffic. The interval is
+	// either Options.PingInterval or this value, whichever is the smallest.
+	gwMaxPingInterval = 15 * time.Second
 )
 
 var (
@@ -56,6 +60,7 @@ var (
 	gatewayReconnectDelay        = defaultGatewayReconnectDelay
 	gatewayMaxRUnsubBeforeSwitch = defaultGatewayMaxRUnsubBeforeSwitch
 	gatewaySolicitDelay          = int64(defaultSolicitGatewaysDelay)
+	gatewayMaxPingInterval       = gwMaxPingInterval
 )
 
 // Warning when user configures gateway TLS insecure
@@ -363,6 +368,29 @@ func (s *Server) newGateway(opts *Options) error {
 	gateway.enabled = opts.Gateway.Name != "" && opts.Gateway.Port != 0
 	s.gateway = gateway
 	return nil
+}
+
+// Update remote gateways TLS configurations after a config reload.
+func (g *srvGateway) updateRemotesTLSConfig(opts *Options) {
+	g.Lock()
+	defer g.Unlock()
+
+	for _, ro := range opts.Gateway.Gateways {
+		if ro.Name == g.name {
+			continue
+		}
+		if cfg, ok := g.remotes[ro.Name]; ok {
+			cfg.Lock()
+			// If TLS config is in remote, use that one, otherwise,
+			// use the TLS config from the main block.
+			if ro.TLSConfig != nil {
+				cfg.TLSConfig = ro.TLSConfig.Clone()
+			} else if opts.Gateway.TLSConfig != nil {
+				cfg.TLSConfig = opts.Gateway.TLSConfig.Clone()
+			}
+			cfg.Unlock()
+		}
+	}
 }
 
 // Returns the Gateway's name of this server.

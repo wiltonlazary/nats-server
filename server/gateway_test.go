@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -6200,4 +6201,134 @@ func TestGatewayUpdateURLsFromRemoteCluster(t *testing.T) {
 	expected[fmt.Sprintf("127.0.0.1:%d", ob1.Gateway.Port)] = "B1"
 	expected[fmt.Sprintf("127.0.0.1:%d", ob3.Gateway.Port)] = "B3"
 	checkURLs(expected)
+}
+
+type capturePingConn struct {
+	net.Conn
+	ch chan struct{}
+}
+
+func (c *capturePingConn) Write(b []byte) (int, error) {
+	if bytes.Contains(b, []byte(pingProto)) {
+		select {
+		case c.ch <- struct{}{}:
+		default:
+		}
+	}
+	return c.Conn.Write(b)
+}
+
+func TestGatewayPings(t *testing.T) {
+	gatewayMaxPingInterval = 50 * time.Millisecond
+	defer func() { gatewayMaxPingInterval = gwMaxPingInterval }()
+
+	ob := testDefaultOptionsForGateway("B")
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	waitForInboundGateways(t, sa, 1, 2*time.Second)
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForInboundGateways(t, sb, 1, 2*time.Second)
+	waitForOutboundGateways(t, sb, 1, 2*time.Second)
+
+	c := sa.getOutboundGatewayConnection("B")
+	ch := make(chan struct{}, 1)
+	c.mu.Lock()
+	c.nc = &capturePingConn{c.nc, ch}
+	c.mu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		select {
+		case <-ch:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatalf("Did not send PING")
+		}
+	}
+}
+
+func TestGatewayTLSConfigReload(t *testing.T) {
+	template := `
+		listen: 127.0.0.1:-1
+		gateway {
+			name: "A"
+			listen: "127.0.0.1:-1"
+			tls {
+				cert_file: "../test/configs/certs/server-cert.pem"
+				key_file:  "../test/configs/certs/server-key.pem"
+				%s
+				timeout: 2
+			}
+		}
+	`
+	confA := createConfFile(t, []byte(fmt.Sprintf(template, "")))
+	defer os.Remove(confA)
+
+	srvA, optsA := RunServerWithConfig(confA)
+	defer srvA.Shutdown()
+
+	optsB := testGatewayOptionsFromToWithTLS(t, "B", "A", []string{fmt.Sprintf("nats://127.0.0.1:%d", optsA.Gateway.Port)})
+	srvB := runGatewayServer(optsB)
+	defer srvB.Shutdown()
+
+	waitForGatewayFailedConnect(t, srvB, "A", true, time.Second)
+
+	reloadUpdateConfig(t, srvA, confA, fmt.Sprintf(template, `ca_file:   "../test/configs/certs/ca.pem"`))
+
+	waitForInboundGateways(t, srvA, 1, time.Second)
+	waitForOutboundGateways(t, srvA, 1, time.Second)
+	waitForInboundGateways(t, srvB, 1, time.Second)
+	waitForOutboundGateways(t, srvB, 1, time.Second)
+}
+
+func TestGatewayTLSConfigReloadForRemote(t *testing.T) {
+	SetGatewaysSolicitDelay(5 * time.Millisecond)
+	defer ResetGatewaysSolicitDelay()
+
+	optsA := testGatewayOptionsWithTLS(t, "A")
+	srvA := runGatewayServer(optsA)
+	defer srvA.Shutdown()
+
+	template := `
+		listen: 127.0.0.1:-1
+		gateway {
+			name: "B"
+			listen: "127.0.0.1:-1"
+			tls {
+				cert_file: "../test/configs/certs/server-cert.pem"
+				key_file:  "../test/configs/certs/server-key.pem"
+				ca_file:   "../test/configs/certs/ca.pem"
+				timeout: 2
+			}
+			gateways [
+				{
+					name: "A"
+					url: "nats://127.0.0.1:%d"
+					tls {
+						cert_file: "../test/configs/certs/server-cert.pem"
+						key_file:  "../test/configs/certs/server-key.pem"
+						%s
+						timeout: 2
+					}
+				}
+			]
+		}
+	`
+	confB := createConfFile(t, []byte(fmt.Sprintf(template, optsA.Gateway.Port, "")))
+	defer os.Remove(confB)
+
+	srvB, _ := RunServerWithConfig(confB)
+	defer srvB.Shutdown()
+
+	waitForGatewayFailedConnect(t, srvB, "A", true, time.Second)
+
+	reloadUpdateConfig(t, srvB, confB, fmt.Sprintf(template, optsA.Gateway.Port, `ca_file: "../test/configs/certs/ca.pem"`))
+
+	waitForInboundGateways(t, srvA, 1, time.Second)
+	waitForOutboundGateways(t, srvA, 1, time.Second)
+	waitForInboundGateways(t, srvB, 1, time.Second)
+	waitForOutboundGateways(t, srvB, 1, time.Second)
 }

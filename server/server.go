@@ -151,6 +151,7 @@ type Server struct {
 		resolver    netResolver
 		dialTimeout time.Duration
 	}
+	leafRemoteCfgs []*leafNodeCfg
 
 	quitCh           chan struct{}
 	shutdownComplete chan struct{}
@@ -221,6 +222,9 @@ type Server struct {
 
 	// Websocket structure
 	websocket srvWebsocket
+
+	// MQTT structure
+	mqtt srvMQTT
 
 	// exporting account name the importer experienced issues with
 	incompleteAccExporterMap sync.Map
@@ -397,7 +401,7 @@ func NewServer(opts *Options) (*Server, error) {
 			s.mu.Unlock()
 			var a *Account
 			// perform direct lookup to avoid warning trace
-			if _, err := ar.Fetch(s.opts.SystemAccount); err == nil {
+			if _, err := fetchAccount(ar, s.opts.SystemAccount); err == nil {
 				a, _ = s.fetchAccount(s.opts.SystemAccount)
 			}
 			s.mu.Lock()
@@ -412,39 +416,6 @@ func NewServer(opts *Options) (*Server, error) {
 	// For tracking accounts
 	if err := s.configureAccounts(); err != nil {
 		return nil, err
-	}
-
-	// In local config mode, check that leafnode configuration
-	// refers to account that exist.
-	if len(opts.TrustedOperators) == 0 {
-		checkAccountExists := func(accName string) error {
-			if accName == _EMPTY_ {
-				return nil
-			}
-			if _, ok := s.accounts.Load(accName); !ok {
-				return fmt.Errorf("cannot find account %q specified in leafnode authorization", accName)
-			}
-			return nil
-		}
-		if err := checkAccountExists(opts.LeafNode.Account); err != nil {
-			return nil, err
-		}
-		for _, lu := range opts.LeafNode.Users {
-			if lu.Account == nil {
-				continue
-			}
-			if err := checkAccountExists(lu.Account.Name); err != nil {
-				return nil, err
-			}
-		}
-		for _, r := range opts.LeafNode.Remotes {
-			if r.LocalAccount == _EMPTY_ {
-				continue
-			}
-			if _, ok := s.accounts.Load(r.LocalAccount); !ok {
-				return nil, fmt.Errorf("no local account %q for remote leafnode", r.LocalAccount)
-			}
-		}
 	}
 
 	// Used to setup Authorization.
@@ -564,6 +535,9 @@ func validateOptions(o *Options) error {
 	}
 	// Check that cluster name if defined matches any gateway name.
 	if err := validateClusterName(o); err != nil {
+		return err
+	}
+	if err := validateMQTTOptions(o); err != nil {
 		return err
 	}
 	// Finally check websocket options.
@@ -1284,7 +1258,7 @@ func (s *Server) fetchRawAccountClaims(name string) (string, error) {
 	}
 	// Need to do actual Fetch
 	start := time.Now()
-	claimJWT, err := accResolver.Fetch(name)
+	claimJWT, err := fetchAccount(accResolver, name)
 	fetchTime := time.Since(start)
 	if fetchTime > time.Second {
 		s.Warnf("Account [%s] fetch took %v", name, fetchTime)
@@ -1305,7 +1279,12 @@ func (s *Server) fetchAccountClaims(name string) (*jwt.AccountClaims, string, er
 	if err != nil {
 		return nil, _EMPTY_, err
 	}
-	return s.verifyAccountClaims(claimJWT)
+	var claim *jwt.AccountClaims
+	claim, claimJWT, err = s.verifyAccountClaims(claimJWT)
+	if claim != nil && claim.Subject != name {
+		return nil, _EMPTY_, ErrAccountValidation
+	}
+	return claim, claimJWT, err
 }
 
 // verifyAccountClaims will decode and validate any account claims.
@@ -1447,7 +1426,7 @@ func (s *Server) Start() {
 						case <-s.quitCh:
 							return
 						case <-t.C:
-							if _, err := ar.Fetch(s.opts.SystemAccount); err != nil {
+							if _, err := fetchAccount(ar, s.opts.SystemAccount); err != nil {
 								continue
 							}
 							if _, err := s.fetchAccount(s.opts.SystemAccount); err != nil {
@@ -1544,6 +1523,11 @@ func (s *Server) Start() {
 		s.startWebsocketServer()
 	}
 
+	// MQTT
+	if opts.MQTT.Port != 0 {
+		s.startMQTT()
+	}
+
 	// Start up routing as well if needed.
 	if opts.Cluster.Port != 0 {
 		s.startGoRoutine(func() {
@@ -1637,6 +1621,13 @@ func (s *Server) Shutdown() {
 		s.websocket.server.Close()
 		s.websocket.server = nil
 		s.websocket.listener = nil
+	}
+
+	// Kick MQTT accept loop
+	if s.mqtt.listener != nil {
+		doneExpected++
+		s.mqtt.listener.Close()
+		s.mqtt.listener = nil
 	}
 
 	// Kick leafnodes AcceptLoop()
@@ -1775,7 +1766,7 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 	s.clientConnectURLs = s.getClientConnectURLs()
 	s.listener = l
 
-	go s.acceptConnections(l, "Client", func(conn net.Conn) { s.createClient(conn, nil) },
+	go s.acceptConnections(l, "Client", func(conn net.Conn) { s.createClient(conn) },
 		func(_ error) bool {
 			if s.isLameDuckMode() {
 				// Signal that we are not accepting new clients
@@ -2101,7 +2092,7 @@ func (c *tlsMixConn) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
-func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
+func (s *Server) createClient(conn net.Conn) *client {
 	// Snapshot server options.
 	opts := s.getOpts()
 
@@ -2113,19 +2104,16 @@ func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 	}
 	now := time.Now()
 
-	c := &client{srv: s, nc: conn, opts: defaultOpts, mpay: maxPay, msubs: maxSubs, start: now, last: now, ws: ws}
+	c := &client{srv: s, nc: conn, opts: defaultOpts, mpay: maxPay, msubs: maxSubs, start: now, last: now}
 
 	c.registerWithAccount(s.globalAccount())
 
-	// Grab JSON info string
+	var info Info
+	var authRequired bool
+
 	s.mu.Lock()
-	info := s.copyInfo()
-	// If this is a websocket client and there is no top-level auth specified,
-	// then we use the websocket's specific boolean that will be set to true
-	// if there is any auth{} configured in websocket{}.
-	if ws != nil && !info.AuthRequired {
-		info.AuthRequired = s.websocket.authOverride
-	}
+	// Grab JSON info string
+	info = s.copyInfo()
 	if s.nonceRequired() {
 		// Nonce handling
 		var raw [nonceLen]byte
@@ -2134,12 +2122,14 @@ func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 		info.Nonce = string(nonce)
 	}
 	c.nonce = []byte(info.Nonce)
+	authRequired = info.AuthRequired
+
 	s.totalClients++
 	s.mu.Unlock()
 
 	// Grab lock
 	c.mu.Lock()
-	if info.AuthRequired {
+	if authRequired {
 		c.flags.set(expectConnect)
 	}
 
@@ -2183,6 +2173,8 @@ func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 		return nil
 	}
 	s.clients[c.cid] = c
+
+	tlsRequired := info.TLSRequired
 	s.mu.Unlock()
 
 	// Re-Grab lock
@@ -2191,7 +2183,6 @@ func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 	// Connection could have been closed while sending the INFO proto.
 	isClosed := c.isClosed()
 
-	tlsRequired := ws == nil && info.TLSRequired
 	var pre []byte
 	// If we have both TLS and non-TLS allowed we need to see which
 	// one the client wants.
@@ -2259,16 +2250,8 @@ func (s *Server) createClient(conn net.Conn, ws *websocket) *client {
 	// Check for Auth. We schedule this timer after the TLS handshake to avoid
 	// the race where the timer fires during the handshake and causes the
 	// server to write bad data to the socket. See issue #432.
-	if info.AuthRequired {
-		timeout := opts.AuthTimeout
-		// For websocket, possibly override only if set. We make sure that
-		// opts.AuthTimeout is set to a default value if not configured,
-		// but we don't do the same for websocket's one so that we know
-		// if user has explicitly set or not.
-		if ws != nil && opts.Websocket.AuthTimeout != 0 {
-			timeout = opts.Websocket.AuthTimeout
-		}
-		c.setAuthTimer(secondsToDuration(timeout))
+	if authRequired {
+		c.setAuthTimer(secondsToDuration(opts.AuthTimeout))
 	}
 
 	// Do final client initialization
@@ -2449,7 +2432,11 @@ func (s *Server) removeClient(c *client) {
 		if updateProtoInfoCount {
 			s.cproto--
 		}
+		mqtt := c.isMqtt()
 		s.mu.Unlock()
+		if mqtt {
+			s.mqttHandleClosedClient(c)
+		}
 	case ROUTER:
 		s.removeRoute(c)
 	case GATEWAY:
@@ -3254,6 +3241,9 @@ func (s *Server) setFirstPingTimer(c *client) {
 		if c.kind != CLIENT {
 			if d > firstPingInterval {
 				d = firstPingInterval
+			}
+			if c.kind == GATEWAY {
+				d = adjustPingIntervalForGateway(d)
 			}
 		} else if d > firstClientPingInterval {
 			d = firstClientPingInterval

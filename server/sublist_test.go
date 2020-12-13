@@ -1085,7 +1085,7 @@ func TestSublistRegisterInterestNotification(t *testing.T) {
 		t.Fatalf("Expected to return false on non-existent notification entry")
 	}
 
-	// This should work.
+	// This should work properly.
 	if err := s.RegisterNotification("foo", ch); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1176,27 +1176,28 @@ func TestSublistRegisterInterestNotification(t *testing.T) {
 	}
 
 	// Let's do some wildcard checks.
+	// Wildcards will not trigger interest.
+	subpwc := newSub("*")
+	s.Insert(subpwc)
+	expectNone()
+
 	if err := s.RegisterNotification("foo", ch); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	expectFalse()
 
-	subpwc := newSub("*")
-	s.Insert(subpwc)
+	s.Insert(sub)
 	expectTrue()
 
-	s.Insert(sub)
-	expectNone()
-
 	s.Remove(sub)
-	expectNone()
+	expectFalse()
 
 	s.Remove(subpwc)
-	expectFalse()
+	expectNone()
 
 	subfwc := newSub(">")
 	s.Insert(subfwc)
-	expectTrue()
+	expectNone()
 
 	s.Insert(subpwc)
 	expectNone()
@@ -1205,7 +1206,7 @@ func TestSublistRegisterInterestNotification(t *testing.T) {
 	expectNone()
 
 	s.Remove(subfwc)
-	expectFalse()
+	expectNone()
 
 	// Test batch
 	subs := []*subscription{sub, sub2, sub3, sub4, subpwc, subfwc}
@@ -1217,6 +1218,29 @@ func TestSublistRegisterInterestNotification(t *testing.T) {
 	s.RemoveBatch(subs)
 	expectOne()
 	expectFalse()
+
+	// Test queue subs
+	qsub := newQSub("foo.bar.baz", "1")
+	s.Insert(qsub)
+	expectNone()
+
+	if err := s.RegisterNotification("foo.bar.baz", ch); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	expectTrue()
+
+	wcqsub := newQSub("foo.bar.>", "1")
+	s.Insert(wcqsub)
+	expectNone()
+
+	s.Remove(qsub)
+	expectFalse()
+
+	s.Remove(wcqsub)
+	expectNone()
+
+	s.Insert(wcqsub)
+	expectNone()
 
 	// Test non-blocking notifications.
 	if err := s.RegisterNotification("bar", ch); err != nil {
@@ -1232,6 +1256,74 @@ func TestSublistRegisterInterestNotification(t *testing.T) {
 	s.Insert(subpwc)
 	expectOne()
 	expectFalse()
+}
+
+func TestSublistReverseMatch(t *testing.T) {
+	s := NewSublistWithCache()
+	fooSub := newSub("foo")
+	barSub := newSub("bar")
+	fooBarSub := newSub("foo.bar")
+	fooBazSub := newSub("foo.baz")
+	fooBarBazSub := newSub("foo.bar.baz")
+	s.Insert(fooSub)
+	s.Insert(barSub)
+	s.Insert(fooBarSub)
+	s.Insert(fooBazSub)
+	s.Insert(fooBarBazSub)
+
+	r := s.ReverseMatch("foo")
+	verifyLen(r.psubs, 1, t)
+	verifyMember(r.psubs, fooSub, t)
+
+	r = s.ReverseMatch("bar")
+	verifyLen(r.psubs, 1, t)
+	verifyMember(r.psubs, barSub, t)
+
+	r = s.ReverseMatch("*")
+	verifyLen(r.psubs, 2, t)
+	verifyMember(r.psubs, fooSub, t)
+	verifyMember(r.psubs, barSub, t)
+
+	r = s.ReverseMatch("baz")
+	verifyLen(r.psubs, 0, t)
+
+	r = s.ReverseMatch("foo.*")
+	verifyLen(r.psubs, 2, t)
+	verifyMember(r.psubs, fooBarSub, t)
+	verifyMember(r.psubs, fooBazSub, t)
+
+	r = s.ReverseMatch("*.*")
+	verifyLen(r.psubs, 2, t)
+	verifyMember(r.psubs, fooBarSub, t)
+	verifyMember(r.psubs, fooBazSub, t)
+
+	r = s.ReverseMatch("*.bar")
+	verifyLen(r.psubs, 1, t)
+	verifyMember(r.psubs, fooBarSub, t)
+
+	r = s.ReverseMatch("*.baz")
+	verifyLen(r.psubs, 1, t)
+	verifyMember(r.psubs, fooBazSub, t)
+
+	r = s.ReverseMatch("bar.*")
+	verifyLen(r.psubs, 0, t)
+
+	r = s.ReverseMatch("*.bat")
+	verifyLen(r.psubs, 0, t)
+
+	r = s.ReverseMatch("foo.>")
+	verifyLen(r.psubs, 3, t)
+	verifyMember(r.psubs, fooBarSub, t)
+	verifyMember(r.psubs, fooBazSub, t)
+	verifyMember(r.psubs, fooBarBazSub, t)
+
+	r = s.ReverseMatch(">")
+	verifyLen(r.psubs, 5, t)
+	verifyMember(r.psubs, fooSub, t)
+	verifyMember(r.psubs, barSub, t)
+	verifyMember(r.psubs, fooBarSub, t)
+	verifyMember(r.psubs, fooBazSub, t)
+	verifyMember(r.psubs, fooBarBazSub, t)
 }
 
 // -- Benchmarks Setup --

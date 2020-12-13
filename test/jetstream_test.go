@@ -15,6 +15,7 @@ package test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -94,6 +95,7 @@ func RunJetStreamServerOnPort(port int, sd string) *server.Server {
 }
 
 func clientConnectToServer(t *testing.T, s *server.Server) *nats.Conn {
+	t.Helper()
 	nc, err := nats.Connect(s.ClientURL(),
 		nats.Name("JS-TEST"),
 		nats.ReconnectWait(5*time.Millisecond),
@@ -284,7 +286,7 @@ func TestJetStreamAddStreamDiscardNew(t *testing.T) {
 			if resp == nil {
 				t.Fatalf("No response, possible timeout?")
 			}
-			if string(resp.Data) != "-ERR 'maximum messages exceeded'" {
+			if pa := getPubAckResponse(resp.Data); pa == nil || pa.Error.Description != "maximum messages exceeded" || pa.Stream != "foo" {
 				t.Fatalf("Expected to get an error about maximum messages, got %q", resp.Data)
 			}
 
@@ -296,11 +298,62 @@ func TestJetStreamAddStreamDiscardNew(t *testing.T) {
 			if resp == nil {
 				t.Fatalf("No response, possible timeout?")
 			}
-			if string(resp.Data) != "-ERR 'maximum bytes exceeded'" {
+			if pa := getPubAckResponse(resp.Data); pa == nil || pa.Error.Description != "maximum bytes exceeded" || pa.Stream != "foo" {
 				t.Fatalf("Expected to get an error about maximum bytes, got %q", resp.Data)
 			}
 		})
 	}
+}
+
+func TestJetStreamAutoTuneFSConfig(t *testing.T) {
+	s := RunRandClientPortServer()
+	defer s.Shutdown()
+
+	jsconfig := &server.JetStreamConfig{MaxMemory: -1, MaxStore: 128 * 1024 * 1024 * 1024 * 1024}
+	if err := s.EnableJetStream(jsconfig); err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	maxMsgSize := int32(512)
+	streamConfig := func(name string, maxMsgs, maxBytes int64) *server.StreamConfig {
+		t.Helper()
+		cfg := &server.StreamConfig{Name: name, MaxMsgSize: maxMsgSize, Storage: server.FileStorage}
+		if maxMsgs > 0 {
+			cfg.MaxMsgs = maxMsgs
+		}
+		if maxBytes > 0 {
+			cfg.MaxBytes = maxBytes
+		}
+		return cfg
+	}
+
+	acc := s.GlobalAccount()
+
+	testBlkSize := func(subject string, maxMsgs, maxBytes int64, expectedBlkSize uint64) {
+		t.Helper()
+		mset, err := acc.AddStream(streamConfig(subject, maxMsgs, maxBytes))
+		if err != nil {
+			t.Fatalf("Unexpected error adding stream: %v", err)
+		}
+		defer mset.Delete()
+		fsCfg, err := mset.FileStoreConfig()
+		if err != nil {
+			t.Fatalf("Unexpected error retrieving file store: %v", err)
+		}
+		if fsCfg.BlockSize != expectedBlkSize {
+			t.Fatalf("Expected auto tuned block size to be %d, got %d", expectedBlkSize, fsCfg.BlockSize)
+		}
+	}
+
+	testBlkSize("foo", 1, 0, server.FileStoreMinBlkSize)
+	testBlkSize("foo", 1, 512, server.FileStoreMinBlkSize)
+	testBlkSize("foo", 1, 1024*1024, 262200)
+	testBlkSize("foo", 1, 8*1024*1024, 2097200)
+	testBlkSize("foo_bar_baz", -1, 32*1024*1024*1024*1024, server.FileStoreMaxBlkSize)
 }
 
 func TestJetStreamPubAck(t *testing.T) {
@@ -330,18 +383,15 @@ func TestJetStreamPubAck(t *testing.T) {
 		if resp == nil {
 			t.Fatalf("No response from send stream msg")
 		}
-		if !bytes.HasPrefix(resp.Data, []byte("+OK {")) {
-			t.Fatalf("Did not get a correct response: %q", resp.Data)
+		pa := getPubAckResponse(resp.Data)
+		if pa == nil || pa.Error != nil {
+			t.Fatalf("Expected a valid JetStreamPubAck, got %q", resp.Data)
 		}
-		var pubAck server.PubAck
-		if err := json.Unmarshal(resp.Data[3:], &pubAck); err != nil {
-			t.Fatalf("Unexpected error: %v", err)
+		if pa.Stream != sname {
+			t.Fatalf("Expected %q for stream name, got %q", sname, pa.Stream)
 		}
-		if pubAck.Stream != sname {
-			t.Fatalf("Expected %q for stream name, got %q", sname, pubAck.Stream)
-		}
-		if pubAck.Seq != seq {
-			t.Fatalf("Expected %d for sequence, got %d", seq, pubAck.Seq)
+		if pa.Sequence != seq {
+			t.Fatalf("Expected %d for sequence, got %d", seq, pa.Sequence)
 		}
 	}
 
@@ -405,11 +455,13 @@ func TestJetStreamConsumerWithStartTime(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
+			defer o.Delete()
+
 			msg, err := nc.Request(o.RequestNextMsgSubject(), nil, time.Second)
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
-			sseq, dseq, _, _ := o.ReplyInfo(msg.Reply)
+			sseq, dseq, _, _, _ := o.ReplyInfo(msg.Reply)
 			if dseq != 1 {
 				t.Fatalf("Expected delivered seq of 1, got %d", dseq)
 			}
@@ -584,6 +636,78 @@ func TestJetStreamPullConsumerDelayedFirstPullWithReplayOriginal(t *testing.T) {
 	}
 }
 
+func TestJetStreamConsumerAckFloorFill(t *testing.T) {
+	cases := []struct {
+		name    string
+		mconfig *server.StreamConfig
+	}{
+		{"MemoryStore", &server.StreamConfig{Name: "MQ", Storage: server.MemoryStorage}},
+		{"FileStore", &server.StreamConfig{Name: "MQ", Storage: server.FileStorage}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer os.RemoveAll(config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().AddStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+			defer mset.Delete()
+
+			nc := clientConnectToServer(t, s)
+			defer nc.Close()
+
+			for i := 1; i <= 4; i++ {
+				sendStreamMsg(t, nc, c.mconfig.Name, fmt.Sprintf("msg-%d", i))
+			}
+
+			sub, _ := nc.SubscribeSync(nats.NewInbox())
+			defer sub.Unsubscribe()
+			nc.Flush()
+
+			o, err := mset.AddConsumer(&server.ConsumerConfig{
+				Durable:        "d",
+				DeliverSubject: sub.Subject,
+				AckPolicy:      server.AckExplicit,
+			})
+			if err != nil {
+				t.Fatalf("Expected no error, got %v", err)
+			}
+			defer o.Delete()
+
+			var first *nats.Msg
+
+			for i := 1; i <= 3; i++ {
+				m, err := sub.NextMsg(time.Second)
+				if err != nil {
+					t.Fatalf("Error receiving message %d: %v", i, err)
+				}
+				// Don't ack 1 or 4.
+				if i == 1 {
+					first = m
+				} else if i == 2 || i == 3 {
+					m.Respond(nil)
+				}
+			}
+			nc.Flush()
+			if info := o.Info(); info.AckFloor.Consumer != 0 {
+				t.Fatalf("Expected the ack floor to be 0, got %d", info.AckFloor.Consumer)
+			}
+			// Now ack first, should move ack floor to 3.
+			first.Respond(nil)
+			nc.Flush()
+			if info := o.Info(); info.AckFloor.Consumer != 3 {
+				t.Fatalf("Expected the ack floor to be 3, got %d", info.AckFloor.Consumer)
+			}
+		})
+	}
+}
+
 func TestJetStreamNoPanicOnRaceBetweenShutdownAndConsumerDelete(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -685,8 +809,8 @@ func TestJetStreamAddStreamMaxMsgSize(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
-			if string(resp.Data) != "-ERR 'message size exceeds maximum allowed'" {
-				t.Fatalf("Expected to get an error for maximum message size, got %q", resp.Data)
+			if pa := getPubAckResponse(resp.Data); pa == nil || pa.Error.Description != "message size exceeds maximum allowed" {
+				t.Fatalf("Expected to get an error for maximum message size, got %q", pa.Error)
 			}
 		})
 	}
@@ -870,15 +994,17 @@ func TestJetStreamAddStreamSameConfigOK(t *testing.T) {
 	}
 }
 
-func sendStreamMsg(t *testing.T, nc *nats.Conn, subject, msg string) {
+func sendStreamMsg(t *testing.T, nc *nats.Conn, subject, msg string) *server.PubAck {
 	t.Helper()
 	resp, _ := nc.Request(subject, []byte(msg), 500*time.Millisecond)
 	if resp == nil {
 		t.Fatalf("No response for %q, possible timeout?", msg)
 	}
-	if !bytes.HasPrefix(resp.Data, []byte("+OK {")) {
-		t.Fatalf("Expected a JetStreamPubAck, got %q", resp.Data)
+	pa := getPubAckResponse(resp.Data)
+	if pa == nil || pa.Error != nil {
+		t.Fatalf("Expected a valid JetStreamPubAck, got %q", resp.Data)
 	}
+	return pa.PubAck
 }
 
 func TestJetStreamBasicAckPublish(t *testing.T) {
@@ -1085,16 +1211,6 @@ func TestJetStreamCreateConsumer(t *testing.T) {
 			defer sub.Unsubscribe()
 			nc.Flush()
 
-			// Filtered subjects can not be AckAll.
-			if _, err := mset.AddConsumer(&server.ConsumerConfig{
-				DeliverSubject: delivery,
-				FilterSubject:  "foo",
-				AckPolicy:      server.AckAll,
-			}); err == nil {
-				t.Fatalf("Expected an error on partitioned consumer with ack policy of all")
-			}
-
-			// This should work..
 			o, err := mset.AddConsumer(&server.ConsumerConfig{DeliverSubject: delivery})
 			if err != nil {
 				t.Fatalf("Expected no error with registered interest, got %v", err)
@@ -1364,7 +1480,7 @@ func TestJetStreamBasicWorkQueue(t *testing.T) {
 
 			go func() {
 				time.Sleep(nextDelay)
-				nc.Request(sendSubj, []byte("Hello World!"), 100*time.Millisecond)
+				sendStreamMsg(t, nc, sendSubj, "Hello World!")
 			}()
 
 			start := time.Now()
@@ -1383,6 +1499,301 @@ func TestJetStreamBasicWorkQueue(t *testing.T) {
 
 			for i := toSend + 2; i < toSend*2+2; i++ {
 				getNext(i)
+			}
+		})
+	}
+}
+
+func TestJetStreamWorkQueueMaxWaiting(t *testing.T) {
+	cases := []struct {
+		name    string
+		mconfig *server.StreamConfig
+	}{
+		{"MemoryStore", &server.StreamConfig{Name: "MY_MSG_SET", Storage: server.MemoryStorage, Subjects: []string{"foo", "bar"}}},
+		{"FileStore", &server.StreamConfig{Name: "MY_MSG_SET", Storage: server.FileStorage, Subjects: []string{"foo", "bar"}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer os.RemoveAll(config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().AddStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+			defer mset.Delete()
+
+			// Make sure these cases fail
+			cfg := &server.ConsumerConfig{Durable: "foo", AckPolicy: server.AckExplicit, MaxWaiting: 10, DeliverSubject: "_INBOX.22"}
+			if _, err := mset.AddConsumer(cfg); err == nil {
+				t.Fatalf("Expected an error with MaxWaiting set on non-pull based consumer")
+			}
+			cfg = &server.ConsumerConfig{Durable: "foo", AckPolicy: server.AckExplicit, MaxWaiting: -1}
+			if _, err := mset.AddConsumer(cfg); err == nil {
+				t.Fatalf("Expected an error with MaxWaiting being negative")
+			}
+
+			// Create basic work queue mode consumer.
+			wcfg := workerModeConfig("MAXWQ")
+			o, err := mset.AddConsumer(wcfg)
+			if err != nil {
+				t.Fatalf("Expected no error with registered interest, got %v", err)
+			}
+			defer o.Delete()
+
+			// Make sure we set default correctly.
+			if cfg := o.Config(); cfg.MaxWaiting != server.JSWaitQueueDefaultMax {
+				t.Fatalf("Expected default max waiting to have been set to %d, got %d", server.JSWaitQueueDefaultMax, cfg.MaxWaiting)
+			}
+
+			expectWaiting := func(expected int) {
+				t.Helper()
+				checkFor(t, time.Second, 25*time.Millisecond, func() error {
+					if oi := o.Info(); oi.NumWaiting != expected {
+						return fmt.Errorf("Expected %d waiting, got %d", expected, oi.NumWaiting)
+					}
+					return nil
+				})
+			}
+
+			nc := clientConnectWithOldRequest(t, s)
+			defer nc.Close()
+
+			// Like muxed new INBOX.
+			sub, _ := nc.SubscribeSync("req.*")
+			defer sub.Unsubscribe()
+			nc.Flush()
+
+			checkSubPending := func(numExpected int) {
+				t.Helper()
+				checkFor(t, 200*time.Millisecond, 10*time.Millisecond, func() error {
+					if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != numExpected {
+						return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, numExpected)
+					}
+					return nil
+				})
+			}
+
+			getSubj := o.RequestNextMsgSubject()
+			// Queue up JSWaitQueueDefaultMax requests.
+			for i := 0; i < server.JSWaitQueueDefaultMax; i++ {
+				nc.PublishRequest(getSubj, fmt.Sprintf("req.%d", i), nil)
+			}
+			expectWaiting(server.JSWaitQueueDefaultMax)
+
+			// So when we submit our next request this one should succeed since we do not want these to fail.
+			// We should get notified that the first request is now stale and has been removed.
+			if _, err := nc.Request(getSubj, nil, 10*time.Millisecond); err != nats.ErrTimeout {
+				t.Fatalf("Expected timeout error, got: %v", err)
+			}
+			checkSubPending(1)
+			m, _ := sub.NextMsg(0)
+			// Make sure this is an alert that tells us our request is now stale.
+			if m.Header.Get("Status") != "408" {
+				t.Fatalf("Expected a 408 status code, got %q", m.Header.Get("Status"))
+			}
+			sendStreamMsg(t, nc, "foo", "Hello World!")
+			sendStreamMsg(t, nc, "bar", "Hello World!")
+			expectWaiting(server.JSWaitQueueDefaultMax - 2)
+		})
+	}
+}
+
+func TestJetStreamWorkQueueWrapWaiting(t *testing.T) {
+	cases := []struct {
+		name    string
+		mconfig *server.StreamConfig
+	}{
+		{"MemoryStore", &server.StreamConfig{Name: "MY_MSG_SET", Storage: server.MemoryStorage, Subjects: []string{"foo", "bar"}}},
+		{"FileStore", &server.StreamConfig{Name: "MY_MSG_SET", Storage: server.FileStorage, Subjects: []string{"foo", "bar"}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer os.RemoveAll(config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().AddStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+			defer mset.Delete()
+
+			maxWaiting := 8
+			wcfg := workerModeConfig("WRAP")
+			wcfg.MaxWaiting = maxWaiting
+
+			o, err := mset.AddConsumer(wcfg)
+			if err != nil {
+				t.Fatalf("Expected no error with registered interest, got %v", err)
+			}
+			defer o.Delete()
+
+			getSubj := o.RequestNextMsgSubject()
+
+			expectWaiting := func(expected int) {
+				t.Helper()
+				checkFor(t, time.Second, 25*time.Millisecond, func() error {
+					if oi := o.Info(); oi.NumWaiting != expected {
+						return fmt.Errorf("Expected %d waiting, got %d", expected, oi.NumWaiting)
+					}
+					return nil
+				})
+			}
+
+			nc := clientConnectToServer(t, s)
+			defer nc.Close()
+
+			sub, _ := nc.SubscribeSync("req.*")
+			defer sub.Unsubscribe()
+			nc.Flush()
+
+			// Fill up waiting.
+			for i := 0; i < maxWaiting; i++ {
+				nc.PublishRequest(getSubj, fmt.Sprintf("req.%d", i), nil)
+			}
+			expectWaiting(maxWaiting)
+
+			// Now use 1/2 of the waiting.
+			for i := 0; i < maxWaiting/2; i++ {
+				sendStreamMsg(t, nc, "foo", "Hello World!")
+			}
+			expectWaiting(maxWaiting / 2)
+
+			// Now add in two (2) more pull requests.
+			for i := maxWaiting; i < maxWaiting+2; i++ {
+				nc.PublishRequest(getSubj, fmt.Sprintf("req.%d", i), nil)
+			}
+			expectWaiting(maxWaiting/2 + 2)
+
+			// Now use second 1/2 of the waiting and the 2 extra.
+			for i := 0; i < maxWaiting/2+2; i++ {
+				sendStreamMsg(t, nc, "bar", "Hello World!")
+			}
+			expectWaiting(0)
+
+			if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != maxWaiting+2 {
+				t.Fatalf("Expected sub to have %d pending, got %d", maxWaiting+2, nmsgs)
+			}
+		})
+	}
+}
+
+func TestJetStreamWorkQueueRequest(t *testing.T) {
+	cases := []struct {
+		name    string
+		mconfig *server.StreamConfig
+	}{
+		{"MemoryStore", &server.StreamConfig{Name: "MY_MSG_SET", Storage: server.MemoryStorage, Subjects: []string{"foo", "bar"}}},
+		{"FileStore", &server.StreamConfig{Name: "MY_MSG_SET", Storage: server.FileStorage, Subjects: []string{"foo", "bar"}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer os.RemoveAll(config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().AddStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+			defer mset.Delete()
+
+			o, err := mset.AddConsumer(workerModeConfig("WRAP"))
+			if err != nil {
+				t.Fatalf("Expected no error with registered interest, got %v", err)
+			}
+			defer o.Delete()
+
+			nc := clientConnectToServer(t, s)
+			defer nc.Close()
+
+			toSend := 25
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "bar", "Hello World!")
+			}
+
+			reply := "_.consumer._"
+			sub, _ := nc.SubscribeSync(reply)
+			defer sub.Unsubscribe()
+
+			getSubj := o.RequestNextMsgSubject()
+
+			checkSubPending := func(numExpected int) {
+				t.Helper()
+				checkFor(t, 200*time.Millisecond, 10*time.Millisecond, func() error {
+					if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != numExpected {
+						return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, numExpected)
+					}
+					return nil
+				})
+			}
+
+			// Create a formal request object.
+			req := &server.JSApiConsumerGetNextRequest{Batch: toSend}
+			jreq, _ := json.Marshal(req)
+			nc.PublishRequest(getSubj, reply, jreq)
+
+			checkSubPending(toSend)
+
+			// Now check that we can ask for NoWait
+			req.Batch = 1
+			req.NoWait = true
+			jreq, _ = json.Marshal(req)
+
+			resp, err := nc.Request(getSubj, jreq, 50*time.Millisecond)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if status := resp.Header.Get("Status"); !strings.HasPrefix(status, "404") {
+				t.Fatalf("Expected status code of 404")
+			}
+			// Load up more messages.
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "foo", "Hello World!")
+			}
+			// Now we will ask for a batch larger then what is queued up.
+			req.Batch = toSend + 10
+			req.NoWait = true
+			jreq, _ = json.Marshal(req)
+			nc.PublishRequest(getSubj, reply, jreq)
+			// We should now have 2 * toSend + the 404 message.
+			checkSubPending(2*toSend + 1)
+			for i := 0; i < 2*toSend+1; i++ {
+				sub.NextMsg(time.Millisecond)
+			}
+			checkSubPending(0)
+			mset.Purge()
+
+			// Now do expiration
+			req.Batch = 1
+			req.NoWait = false
+			req.Expires = time.Now().Add(10 * time.Millisecond)
+			jreq, _ = json.Marshal(req)
+
+			nc.PublishRequest(getSubj, reply, jreq)
+			// Let it expire
+			time.Sleep(20 * time.Millisecond)
+
+			// Send a few more messages. These should not be delivered to the sub.
+			sendStreamMsg(t, nc, "foo", "Hello World!")
+			sendStreamMsg(t, nc, "bar", "Hello World!")
+			// We will have an alert here.
+			checkSubPending(1)
+			m, _ := sub.NextMsg(0)
+			// Make sure this is an alert that tells us our request is now stale.
+			if m.Header.Get("Status") != "408" {
+				t.Fatalf("Expected a 408 status code, got %q", m.Header.Get("Status"))
 			}
 		})
 	}
@@ -1791,6 +2202,26 @@ func TestJetStreamWorkQueueRequestBatch(t *testing.T) {
 				}
 				return nil
 			})
+
+			// Now queue up the request without messages and add them after.
+			sub, _ = nc.SubscribeSync(nats.NewInbox())
+			defer sub.Unsubscribe()
+			mset.Purge()
+
+			nc.PublishRequest(o.RequestNextMsgSubject(), sub.Subject, []byte(strconv.Itoa(batchSize)))
+			nc.Flush() // Make sure its registered.
+
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, sendSubj, "Hello World!")
+			}
+
+			// We should receive batchSize with no acks or additional requests.
+			checkFor(t, 250*time.Millisecond, 10*time.Millisecond, func() error {
+				if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != batchSize {
+					return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, batchSize)
+				}
+				return nil
+			})
 		})
 	}
 }
@@ -2003,6 +2434,240 @@ func TestJetStreamAckAllRedelivery(t *testing.T) {
 	}
 }
 
+func TestJetStreamAckReplyStreamPending(t *testing.T) {
+	msc := server.StreamConfig{
+		Name:      "MY_WQ",
+		Subjects:  []string{"foo.*"},
+		Storage:   server.MemoryStorage,
+		MaxAge:    250 * time.Millisecond,
+		Retention: server.WorkQueuePolicy,
+	}
+	fsc := msc
+	fsc.Storage = server.FileStorage
+
+	cases := []struct {
+		name    string
+		mconfig *server.StreamConfig
+	}{
+		{"MemoryStore", &msc},
+		{"FileStore", &fsc},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer os.RemoveAll(config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().AddStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+			defer mset.Delete()
+
+			nc := clientConnectToServer(t, s)
+			defer nc.Close()
+
+			// Now load up some messages.
+			toSend := 100
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "foo.1", "Hello World!")
+			}
+			nc.Flush()
+
+			state := mset.State()
+			if state.Msgs != uint64(toSend) {
+				t.Fatalf("Expected %d messages, got %d", toSend, state.Msgs)
+			}
+
+			o, err := mset.AddConsumer(&server.ConsumerConfig{Durable: "PBO", AckPolicy: server.AckExplicit})
+			if err != nil {
+				t.Fatalf("Expected no error, got %v", err)
+			}
+			defer o.Delete()
+
+			expectPending := func(ep int) {
+				t.Helper()
+				// Now check consumer info.
+				checkFor(t, time.Second, 10*time.Millisecond, func() error {
+					if info, pep := o.Info(), ep+1; int(info.NumPending) != pep {
+						return fmt.Errorf("Expected consumer info pending of %d, got %d", pep, info.NumPending)
+					}
+					return nil
+				})
+				m, err := nc.Request(o.RequestNextMsgSubject(), nil, time.Second)
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				_, _, _, _, pending := o.ReplyInfo(m.Reply)
+				if pending != uint64(ep) {
+					t.Fatalf("Expected ack reply pending of %d, got %d - reply: %q", ep, pending, m.Reply)
+				}
+			}
+
+			expectPending(toSend - 1)
+			// Send some more while we are connected.
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "foo.1", "Hello World!")
+			}
+			nc.Flush()
+
+			expectPending(toSend*2 - 2)
+			// Purge and send a new one.
+			mset.Purge()
+			nc.Flush()
+
+			sendStreamMsg(t, nc, "foo.1", "Hello World!")
+			expectPending(0)
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "foo.22", "Hello World!")
+			}
+			expectPending(toSend - 1) // 201
+			// Test that delete will not register for consumed messages.
+			mset.RemoveMsg(mset.State().FirstSeq)
+			expectPending(toSend - 2) // 202
+			// Now remove one that has not been delivered.
+			mset.RemoveMsg(250)
+			expectPending(toSend - 4) // 203
+
+			// Test Expiration.
+			mset.Purge()
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "foo.1", "Hello World!")
+			}
+			nc.Flush()
+
+			// Wait for expiration to kick in.
+			checkFor(t, time.Second, 10*time.Millisecond, func() error {
+				if state := mset.State(); state.Msgs != 0 {
+					return fmt.Errorf("Stream still has messages")
+				}
+				return nil
+			})
+			sendStreamMsg(t, nc, "foo.33", "Hello World!")
+			expectPending(0)
+
+			// Now do filtered consumers.
+			o.Delete()
+			o, err = mset.AddConsumer(&server.ConsumerConfig{Durable: "PBO-FILTERED", AckPolicy: server.AckExplicit, FilterSubject: "foo.22"})
+			if err != nil {
+				t.Fatalf("Expected no error, got %v", err)
+			}
+			defer o.Delete()
+
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "foo.33", "Hello World!")
+			}
+			nc.Flush()
+
+			if info := o.Info(); info.NumPending != 0 {
+				t.Fatalf("Expected no pending, got %d", info.NumPending)
+			}
+			// Now send one message that will match us.
+			sendStreamMsg(t, nc, "foo.22", "Hello World!")
+			expectPending(0)
+			sendStreamMsg(t, nc, "foo.22", "Hello World!") // 504
+			sendStreamMsg(t, nc, "foo.22", "Hello World!") // 505
+			sendStreamMsg(t, nc, "foo.22", "Hello World!") // 506
+			sendStreamMsg(t, nc, "foo.22", "Hello World!") // 507
+			expectPending(3)
+			mset.RemoveMsg(506)
+			expectPending(1)
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "foo.22", "Hello World!")
+			}
+			nc.Flush()
+			expectPending(100)
+			mset.Purge()
+			sendStreamMsg(t, nc, "foo.22", "Hello World!")
+			expectPending(0)
+		})
+	}
+}
+
+func TestJetStreamAckReplyStreamPendingWithAcks(t *testing.T) {
+	msc := server.StreamConfig{
+		Name:     "MY_STREAM",
+		Subjects: []string{"foo", "bar", "baz"},
+		Storage:  server.MemoryStorage,
+	}
+	fsc := msc
+	fsc.Storage = server.FileStorage
+
+	cases := []struct {
+		name    string
+		mconfig *server.StreamConfig
+	}{
+		{"MemoryStore", &msc},
+		{"FileStore", &fsc},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer os.RemoveAll(config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().AddStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+			defer mset.Delete()
+
+			nc := clientConnectToServer(t, s)
+			defer nc.Close()
+
+			// Now load up some messages.
+			toSend := 500
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "foo", "Hello Foo!")
+				sendStreamMsg(t, nc, "bar", "Hello Bar!")
+				sendStreamMsg(t, nc, "baz", "Hello Baz!")
+			}
+			state := mset.State()
+			if state.Msgs != uint64(toSend*3) {
+				t.Fatalf("Expected %d messages, got %d", toSend*3, state.Msgs)
+			}
+			dsubj := "_d_"
+			o, err := mset.AddConsumer(&server.ConsumerConfig{
+				Durable:        "D-1",
+				AckPolicy:      server.AckExplicit,
+				FilterSubject:  "foo",
+				DeliverSubject: dsubj,
+			})
+			if err != nil {
+				t.Fatalf("Expected no error, got %v", err)
+			}
+			defer o.Delete()
+
+			if info := o.Info(); int(info.NumPending) != toSend {
+				t.Fatalf("Expected consumer info pending of %d, got %d", toSend, info.NumPending)
+			}
+
+			sub, _ := nc.SubscribeSync(dsubj)
+			defer sub.Unsubscribe()
+
+			checkFor(t, 500*time.Millisecond, 10*time.Millisecond, func() error {
+				if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != toSend {
+					return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, toSend)
+				}
+				return nil
+			})
+
+			// Should be zero.
+			if info := o.Info(); int(info.NumPending) != 0 {
+				t.Fatalf("Expected consumer info pending of %d, got %d", 0, info.NumPending)
+			} else if info.NumAckPending != toSend {
+				t.Fatalf("Expected %d to be pending acks, got %d", toSend, info.NumAckPending)
+			}
+		})
+	}
+}
+
 func TestJetStreamWorkQueueAckWaitRedelivery(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -2077,7 +2742,7 @@ func TestJetStreamWorkQueueAckWaitRedelivery(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Unexpected error waiting for message[%d]: %v", i, err)
 				}
-				sseq, dseq, dcount, _ := o.ReplyInfo(m.Reply)
+				sseq, dseq, dcount, _, _ := o.ReplyInfo(m.Reply)
 				if sseq != uint64(i) {
 					t.Fatalf("Expected set sequence of %d , got %d", i, sseq)
 				}
@@ -2155,7 +2820,7 @@ func TestJetStreamWorkQueueNakRedelivery(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
 				}
-				rsseq, rdseq, _, _ := o.ReplyInfo(m.Reply)
+				rsseq, rdseq, _, _, _ := o.ReplyInfo(m.Reply)
 				if rdseq != uint64(dseq) {
 					t.Fatalf("Expected delivered sequence of %d , got %d", dseq, rdseq)
 				}
@@ -2235,7 +2900,7 @@ func TestJetStreamWorkQueueWorkingIndicator(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
 				}
-				rsseq, rdseq, _, _ := o.ReplyInfo(m.Reply)
+				rsseq, rdseq, _, _, _ := o.ReplyInfo(m.Reply)
 				if rdseq != uint64(dseq) {
 					t.Fatalf("Expected delivered sequence of %d , got %d", dseq, rdseq)
 				}
@@ -2322,7 +2987,7 @@ func TestJetStreamWorkQueueTerminateDelivery(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
 				}
-				rsseq, rdseq, _, _ := o.ReplyInfo(m.Reply)
+				rsseq, rdseq, _, _, _ := o.ReplyInfo(m.Reply)
 				if rdseq != uint64(dseq) {
 					t.Fatalf("Expected delivered sequence of %d , got %d", dseq, rdseq)
 				}
@@ -2398,14 +3063,14 @@ func TestJetStreamConsumerAckAck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Expected no error with registered interest, got %v", err)
 	}
-	rqn := o.RequestNextMsgSubject()
 	defer o.Delete()
+	rqn := o.RequestNextMsgSubject()
 
 	nc := clientConnectToServer(t, s)
 	defer nc.Close()
 
-	// 5 for number of ack protocols to test them all.
-	for i := 0; i < 5; i++ {
+	// 4 for number of ack protocols to test them all.
+	for i := 0; i < 4; i++ {
 		sendStreamMsg(t, nc, mname, "Hello World!")
 	}
 
@@ -2423,8 +3088,103 @@ func TestJetStreamConsumerAckAck(t *testing.T) {
 	testAck(server.AckAck)
 	testAck(server.AckNak)
 	testAck(server.AckProgress)
-	testAck(server.AckNext)
 	testAck(server.AckTerm)
+}
+
+func TestJetStreamAckNext(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	mname := "ACKNXT"
+	mset, err := s.GlobalAccount().AddStream(&server.StreamConfig{Name: mname, Storage: server.MemoryStorage})
+	if err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+	defer mset.Delete()
+
+	o, err := mset.AddConsumer(&server.ConsumerConfig{Durable: "worker", AckPolicy: server.AckExplicit})
+	if err != nil {
+		t.Fatalf("Expected no error with registered interest, got %v", err)
+	}
+	defer o.Delete()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	for i := 0; i < 12; i++ {
+		sendStreamMsg(t, nc, mname, fmt.Sprintf("msg %d", i))
+	}
+
+	q := make(chan *nats.Msg, 10)
+	sub, err := nc.ChanSubscribe(nats.NewInbox(), q)
+	if err != nil {
+		t.Fatalf("SubscribeSync failed: %s", err)
+	}
+
+	nc.PublishRequest(o.RequestNextMsgSubject(), sub.Subject, []byte("1"))
+
+	// normal next should imply 1
+	msg := <-q
+	err = msg.RespondMsg(&nats.Msg{Reply: sub.Subject, Subject: msg.Reply, Data: server.AckNext})
+	if err != nil {
+		t.Fatalf("RespondMsg failed: %s", err)
+	}
+
+	// read 1 message and check ack was done etc
+	msg = <-q
+	if len(q) != 0 {
+		t.Fatalf("Expected empty q got %d", len(q))
+	}
+	if o.Info().AckFloor.Stream != 1 {
+		t.Fatalf("First message was not acknowledged")
+	}
+	if !bytes.Equal(msg.Data, []byte("msg 1")) {
+		t.Fatalf("wrong message received, expected: msg 1 got %q", msg.Data)
+	}
+
+	// now ack and request 5 more using a naked number
+	err = msg.RespondMsg(&nats.Msg{Reply: sub.Subject, Subject: msg.Reply, Data: append(server.AckNext, []byte(" 5")...)})
+	if err != nil {
+		t.Fatalf("RespondMsg failed: %s", err)
+	}
+
+	getMsgs := func(start, count int) {
+		t.Helper()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+
+		for i := start; i < count+1; i++ {
+			select {
+			case msg := <-q:
+				expect := fmt.Sprintf("msg %d", i+1)
+				if !bytes.Equal(msg.Data, []byte(expect)) {
+					t.Fatalf("wrong message received, expected: %s got %#v", expect, msg)
+				}
+			case <-ctx.Done():
+				t.Fatalf("did not receive all messages")
+			}
+		}
+
+	}
+
+	getMsgs(1, 5)
+
+	// now ack and request 5 more using the full request
+	err = msg.RespondMsg(&nats.Msg{Reply: sub.Subject, Subject: msg.Reply, Data: append(server.AckNext, []byte(`{"batch": 5}`)...)})
+	if err != nil {
+		t.Fatalf("RespondMsg failed: %s", err)
+	}
+
+	getMsgs(6, 10)
+
+	if o.Info().AckFloor.Stream != 2 {
+		t.Fatalf("second message was not acknowledged")
+	}
 }
 
 func TestJetStreamPublishDeDupe(t *testing.T) {
@@ -2466,23 +3226,20 @@ func TestJetStreamPublishDeDupe(t *testing.T) {
 	sendMsg := func(seq uint64, id, msg string) *server.PubAck {
 		t.Helper()
 		m := nats.NewMsg(fmt.Sprintf("foo.%d", seq))
-		m.Header.Add(server.JSPubId, id)
+		m.Header.Add(server.JSMsgId, id)
 		m.Data = []byte(msg)
 		resp, _ := nc.RequestMsg(m, 100*time.Millisecond)
 		if resp == nil {
 			t.Fatalf("No response for %q, possible timeout?", msg)
 		}
-		if !bytes.HasPrefix(resp.Data, []byte("+OK {")) {
+		pa := getPubAckResponse(resp.Data)
+		if pa == nil || pa.Error != nil {
 			t.Fatalf("Expected a JetStreamPubAck, got %q", resp.Data)
 		}
-		var pubAck server.PubAck
-		if err := json.Unmarshal(resp.Data[3:], &pubAck); err != nil {
-			t.Fatalf("Unexpected error: %v", err)
+		if pa.Sequence != seq {
+			t.Fatalf("Did not get correct sequence in PubAck, expected %d, got %d", seq, pa.Sequence)
 		}
-		if pubAck.Seq != seq {
-			t.Fatalf("Did not get correct sequence in PubAck, expected %d, got %d", seq, pubAck.Seq)
-		}
-		return &pubAck
+		return pa.PubAck
 	}
 
 	expect := func(n uint64) {
@@ -2537,7 +3294,6 @@ func TestJetStreamPublishDeDupe(t *testing.T) {
 	if err := mset.Update(&cfg); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-
 	mset.Purge()
 
 	// Send 5 new messages.
@@ -2580,6 +3336,114 @@ func TestJetStreamPublishDeDupe(t *testing.T) {
 	pa := sendMsg(10, "AAAA", "Hello DeDupe!")
 	if !pa.Duplicate {
 		t.Fatalf("Expected duplicate to be set")
+	}
+
+	// Purge should wipe the msgIds as well.
+	mset.Purge()
+	nmids(0)
+}
+
+func getPubAckResponse(msg []byte) *server.JSPubAckResponse {
+	var par server.JSPubAckResponse
+	if err := json.Unmarshal(msg, &par); err != nil {
+		return nil
+	}
+	return &par
+}
+
+func TestJetStreamPublishExpect(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	mname := "EXPECT"
+	mset, err := s.GlobalAccount().AddStream(&server.StreamConfig{Name: mname, Storage: server.FileStorage, MaxAge: time.Hour, Subjects: []string{"foo.*"}})
+	if err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+	defer mset.Delete()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	// Test that we get no error when expected stream is correct.
+	m := nats.NewMsg("foo.bar")
+	m.Data = []byte("HELLO")
+	m.Header.Set(server.JSExpectedStream, mname)
+	resp, err := nc.RequestMsg(m, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if pa := getPubAckResponse(resp.Data); pa == nil || pa.Error != nil {
+		t.Fatalf("Expected a valid JetStreamPubAck, got %q", resp.Data)
+	}
+
+	// Now test that we get an error back when expecting a different stream.
+	m.Header.Set(server.JSExpectedStream, "ORDERS")
+	resp, err = nc.RequestMsg(m, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if pa := getPubAckResponse(resp.Data); pa == nil || pa.Error == nil {
+		t.Fatalf("Expected an error, got %q", resp.Data)
+	}
+
+	// Now test that we get an error back when expecting a different sequence number.
+	m.Header.Set(server.JSExpectedStream, mname)
+	m.Header.Set(server.JSExpectedLastSeq, "10")
+	resp, err = nc.RequestMsg(m, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if pa := getPubAckResponse(resp.Data); pa == nil || pa.Error == nil {
+		t.Fatalf("Expected an error, got %q", resp.Data)
+	}
+
+	// Now send a message with a message ID and make sure we can match that.
+	m = nats.NewMsg("foo.bar")
+	m.Data = []byte("HELLO")
+	m.Header.Set(server.JSMsgId, "AAA")
+	if _, err = nc.RequestMsg(m, 100*time.Millisecond); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Now try again with new message ID but require last one to be 'BBB'
+	m.Header.Set(server.JSMsgId, "ZZZ")
+	m.Header.Set(server.JSExpectedLastMsgId, "BBB")
+	resp, err = nc.RequestMsg(m, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if pa := getPubAckResponse(resp.Data); pa == nil || pa.Error == nil {
+		t.Fatalf("Expected an error, got %q", resp.Data)
+	}
+
+	// Restart the server and make sure we remember/rebuild last seq and last msgId.
+	// Stop current server.
+	sd := s.JetStreamConfig().StoreDir
+	s.Shutdown()
+	// Restart.
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc = clientConnectToServer(t, s)
+	defer nc.Close()
+
+	// Our last sequence was 2 and last msgId was "AAA"
+	m = nats.NewMsg("foo.baz")
+	m.Data = []byte("HELLO AGAIN")
+	m.Header.Set(server.JSExpectedLastSeq, "2")
+	m.Header.Set(server.JSExpectedLastMsgId, "AAA")
+	m.Header.Set(server.JSMsgId, "BBB")
+	resp, err = nc.RequestMsg(m, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if pa := getPubAckResponse(resp.Data); pa == nil || pa.Error != nil {
+		t.Fatalf("Expected a valid JetStreamPubAck, got %q", resp.Data)
 	}
 }
 
@@ -2638,7 +3502,7 @@ func TestJetStreamPullConsumerRemoveInterest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	_, dseq, dc, _ := o.ReplyInfo(msg.Reply)
+	_, dseq, dc, _, _ := o.ReplyInfo(msg.Reply)
 	if dseq != 1 {
 		t.Fatalf("Expected consumer sequence of 1, got %d", dseq)
 	}
@@ -2664,7 +3528,7 @@ func TestJetStreamPullConsumerRemoveInterest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	_, dseq, dc, _ = o.ReplyInfo(msg.Reply)
+	_, dseq, dc, _, _ = o.ReplyInfo(msg.Reply)
 	if dseq != 2 {
 		t.Fatalf("Expected consumer sequence of 2, got %d", dseq)
 	}
@@ -2900,13 +3764,13 @@ func TestJetStreamConsumerMaxDeliveryAndServerRestart(t *testing.T) {
 	streamCreated := mset.Created()
 
 	dsubj := "D.TO"
-	max := 4
+	max := 3
 
 	o, err := mset.AddConsumer(&server.ConsumerConfig{
 		Durable:        "TO",
 		DeliverSubject: dsubj,
 		AckPolicy:      server.AckExplicit,
-		AckWait:        25 * time.Millisecond,
+		AckWait:        100 * time.Millisecond,
 		MaxDeliver:     max,
 	})
 	defer o.Delete()
@@ -2970,6 +3834,15 @@ func TestJetStreamConsumerMaxDeliveryAndServerRestart(t *testing.T) {
 		s = RunJetStreamServerOnPort(port, sd)
 	}
 
+	waitForClientReconnect := func() {
+		checkFor(t, 2500*time.Millisecond, 5*time.Millisecond, func() error {
+			if !nc.IsConnected() {
+				return fmt.Errorf("Not connected")
+			}
+			return nil
+		})
+	}
+
 	// Restart.
 	restartServer()
 	defer s.Shutdown()
@@ -2977,17 +3850,10 @@ func TestJetStreamConsumerMaxDeliveryAndServerRestart(t *testing.T) {
 	checkNumMsgs(2)
 
 	// Wait for client to be reconnected.
-	checkFor(t, 2500*time.Millisecond, 5*time.Millisecond, func() error {
-		if !nc.IsConnected() {
-			return fmt.Errorf("Not connected")
-		}
-		return nil
-	})
+	waitForClientReconnect()
 
 	// Once we are here send third order.
-	// Send third
 	sendStreamMsg(t, nc, mname, "order-3")
-
 	checkNumMsgs(3)
 
 	// Restart.
@@ -2995,6 +3861,9 @@ func TestJetStreamConsumerMaxDeliveryAndServerRestart(t *testing.T) {
 	defer s.Shutdown()
 
 	checkNumMsgs(3)
+
+	// Wait for client to be reconnected.
+	waitForClientReconnect()
 
 	// Now we should have max times three on our sub.
 	checkSubPending(max * 3)
@@ -3255,7 +4124,7 @@ func TestJetStreamSnapshots(t *testing.T) {
 	for _, oi := range info.obs {
 		if o := mset.LookupConsumer(oi.cfg.Durable); o != nil {
 			if uint64(oi.ack+1) != o.NextSeq() {
-				t.Fatalf("Consumer next seq is not correct: %d vs %d", oi.ack+1, o.NextSeq())
+				t.Fatalf("[%v] Consumer next seq is not correct: %d vs %d", o.Name(), oi.ack+1, o.NextSeq())
 			}
 		} else {
 			t.Fatalf("Expected to get an consumer")
@@ -3878,6 +4747,7 @@ func TestJetStreamConsumerReconnect(t *testing.T) {
 			sub.Unsubscribe()
 			// Re-establish new sub on same subject.
 			sub, _ = nc.SubscribeSync(delivery)
+			nc.Flush()
 
 			// We should be getting 2 here.
 			sendMsg() // 2
@@ -4106,7 +4976,7 @@ func TestJetStreamDurableConsumerReconnectWithOnlyPending(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
 				}
-				sseq, _, dc, _ := o.ReplyInfo(msg.Reply)
+				sseq, _, dc, _, _ := o.ReplyInfo(msg.Reply)
 				if sseq == 1 && dc == 1 {
 					t.Fatalf("Expected a redelivery count greater then 1 for sseq 1, got %d", dc)
 				}
@@ -4191,7 +5061,7 @@ func TestJetStreamDurableFilteredSubjectConsumerReconnect(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
 				}
-				rsseq, roseq, dcount, _ := o.ReplyInfo(m.Reply)
+				rsseq, roseq, dcount, _, _ := o.ReplyInfo(m.Reply)
 				if roseq != uint64(seq) {
 					t.Fatalf("Expected consumer sequence of %d , got %d", seq, roseq)
 				}
@@ -4210,7 +5080,7 @@ func TestJetStreamDurableFilteredSubjectConsumerReconnect(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
 				}
-				_, roseq, dcount, _ := o.ReplyInfo(m.Reply)
+				_, roseq, dcount, _, _ := o.ReplyInfo(m.Reply)
 				if roseq != uint64(seq) {
 					t.Fatalf("Expected consumer sequence of %d , got %d", seq, roseq)
 				}
@@ -4376,7 +5246,7 @@ func TestJetStreamMetadata(t *testing.T) {
 					t.Fatalf("Unexpected error: %v", err)
 				}
 
-				sseq, dseq, dcount, ts := o.ReplyInfo(m.Reply)
+				sseq, dseq, dcount, ts, _ := o.ReplyInfo(m.Reply)
 
 				mreq := &server.JSApiMsgGetRequest{Seq: sseq}
 				req, err := json.Marshal(mreq)
@@ -4482,7 +5352,7 @@ func TestJetStreamRedeliverCount(t *testing.T) {
 					t.Fatalf("Unexpected error: %v", err)
 				}
 
-				sseq, dseq, dcount, _ := o.ReplyInfo(m.Reply)
+				sseq, dseq, dcount, _, _ := o.ReplyInfo(m.Reply)
 
 				// Make sure we keep getting stream sequence #1
 				if sseq != 1 {
@@ -4795,11 +5665,11 @@ func TestJetStreamStreamPurgeWithConsumer(t *testing.T) {
 				}
 			}
 			state := o.Info()
-			if state.AckFloor.ConsumerSeq != 50 {
-				t.Fatalf("Expected ack floor of 50, got %d", state.AckFloor.ConsumerSeq)
+			if state.AckFloor.Consumer != 50 {
+				t.Fatalf("Expected ack floor of 50, got %d", state.AckFloor.Consumer)
 			}
-			if state.NumPending != 25 {
-				t.Fatalf("Expected len(pending) to be 25, got %d", state.NumPending)
+			if state.NumAckPending != 25 {
+				t.Fatalf("Expected len(pending) to be 25, got %d", state.NumAckPending)
 			}
 			// Now do purge.
 			mset.Purge()
@@ -4810,18 +5680,18 @@ func TestJetStreamStreamPurgeWithConsumer(t *testing.T) {
 			// Pending should be cleared, and stream sequences should have been set
 			// to the total messages before purge + 1.
 			state = o.Info()
-			if state.NumPending != 0 {
-				t.Fatalf("Expected no pending, got %d", state.NumPending)
+			if state.NumAckPending != 0 {
+				t.Fatalf("Expected no pending, got %d", state.NumAckPending)
 			}
-			if state.Delivered.StreamSeq != 100 {
-				t.Fatalf("Expected to have setseq now at next seq of 100, got %d", state.Delivered.StreamSeq)
+			if state.Delivered.Stream != 100 {
+				t.Fatalf("Expected to have setseq now at next seq of 100, got %d", state.Delivered.Stream)
 			}
 			// Check AckFloors which should have also been adjusted.
-			if state.AckFloor.StreamSeq != 100 {
-				t.Fatalf("Expected ackfloor for setseq to be 100, got %d", state.AckFloor.StreamSeq)
+			if state.AckFloor.Stream != 100 {
+				t.Fatalf("Expected ackfloor for setseq to be 100, got %d", state.AckFloor.Stream)
 			}
-			if state.AckFloor.ConsumerSeq != 75 {
-				t.Fatalf("Expected ackfloor for obsseq to be 75, got %d", state.AckFloor.ConsumerSeq)
+			if state.AckFloor.Consumer != 75 {
+				t.Fatalf("Expected ackfloor for obsseq to be 75, got %d", state.AckFloor.Consumer)
 			}
 			// Also make sure we can get new messages correctly.
 			nc.Request("DC", []byte("OK-22"), time.Second)
@@ -4898,18 +5768,18 @@ func TestJetStreamStreamPurgeWithConsumerAndRedelivery(t *testing.T) {
 			// Pending should be cleared, and stream sequences should have been set
 			// to the total messages before purge + 1.
 			state := o.Info()
-			if state.NumPending != 0 {
-				t.Fatalf("Expected no pending, got %d", state.NumPending)
+			if state.NumAckPending != 0 {
+				t.Fatalf("Expected no pending, got %d", state.NumAckPending)
 			}
-			if state.Delivered.StreamSeq != 100 {
-				t.Fatalf("Expected to have setseq now at next seq of 100, got %d", state.Delivered.StreamSeq)
+			if state.Delivered.Stream != 100 {
+				t.Fatalf("Expected to have setseq now at next seq of 100, got %d", state.Delivered.Stream)
 			}
 			// Check AckFloors which should have also been adjusted.
-			if state.AckFloor.StreamSeq != 100 {
-				t.Fatalf("Expected ackfloor for setseq to be 100, got %d", state.AckFloor.StreamSeq)
+			if state.AckFloor.Stream != 100 {
+				t.Fatalf("Expected ackfloor for setseq to be 100, got %d", state.AckFloor.Stream)
 			}
-			if state.AckFloor.ConsumerSeq != 50 {
-				t.Fatalf("Expected ackfloor for obsseq to be 75, got %d", state.AckFloor.ConsumerSeq)
+			if state.AckFloor.Consumer != 50 {
+				t.Fatalf("Expected ackfloor for obsseq to be 75, got %d", state.AckFloor.Consumer)
 			}
 			// Also make sure we can get new messages correctly.
 			nc.Request("DC", []byte("OK-22"), time.Second)
@@ -5067,6 +5937,71 @@ func TestJetStreamInterestRetentionStream(t *testing.T) {
 	}
 }
 
+func TestJetStreamInterestRetentionWithWildcardsAndFilteredConsumers(t *testing.T) {
+	msc := server.StreamConfig{
+		Name:      "DCWC",
+		Subjects:  []string{"foo.*"},
+		Storage:   server.MemoryStorage,
+		Retention: server.InterestPolicy,
+	}
+	fsc := msc
+	fsc.Storage = server.FileStorage
+
+	cases := []struct {
+		name    string
+		mconfig *server.StreamConfig
+	}{
+		{"MemoryStore", &msc},
+		{"FileStore", &fsc},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer os.RemoveAll(config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().AddStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+			defer mset.Delete()
+
+			nc := clientConnectToServer(t, s)
+			defer nc.Close()
+
+			// Send 10 msgs
+			for i := 0; i < 10; i++ {
+				sendStreamMsg(t, nc, "foo.bar", "Hello World!")
+			}
+			if state := mset.State(); state.Msgs != 0 {
+				t.Fatalf("Expected %d messages, got %d", 0, state.Msgs)
+			}
+
+			cfg := &server.ConsumerConfig{Durable: "ddd", FilterSubject: "foo.bar", AckPolicy: server.AckExplicit}
+			o, err := mset.AddConsumer(cfg)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			defer o.Delete()
+
+			sendStreamMsg(t, nc, "foo.bar", "Hello World!")
+			if state := mset.State(); state.Msgs != 1 {
+				t.Fatalf("Expected %d message, got %d", 1, state.Msgs)
+			} else if state.FirstSeq != 11 {
+				t.Fatalf("Expected %d for first seq, got %d", 11, state.FirstSeq)
+			}
+			// Now send to foo.baz, which has no interest, so we should not hold onto this message.
+			sendStreamMsg(t, nc, "foo.baz", "Hello World!")
+			if state := mset.State(); state.Msgs != 1 {
+				t.Fatalf("Expected %d message, got %d", 1, state.Msgs)
+			}
+		})
+	}
+}
+
 func TestJetStreamInterestRetentionStreamWithDurableRestart(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -5092,9 +6027,12 @@ func TestJetStreamInterestRetentionStreamWithDurableRestart(t *testing.T) {
 
 			checkNumMsgs := func(numExpected int) {
 				t.Helper()
-				if state := mset.State(); state.Msgs != uint64(numExpected) {
-					t.Fatalf("Expected %d messages, got %d", numExpected, state.Msgs)
-				}
+				checkFor(t, 200*time.Millisecond, 10*time.Millisecond, func() error {
+					if state := mset.State(); state.Msgs != uint64(numExpected) {
+						return fmt.Errorf("Expected %d messages, got %d", numExpected, state.Msgs)
+					}
+					return nil
+				})
 			}
 
 			nc := clientConnectToServer(t, s)
@@ -5891,8 +6829,13 @@ type info struct {
 func TestJetStreamSimpleFileStorageRecovery(t *testing.T) {
 	base := runtime.NumGoroutine()
 
-	s := RunBasicJetStreamServer()
+	s := RunRandClientPortServer()
 	defer s.Shutdown()
+
+	jsconfig := &server.JetStreamConfig{MaxMemory: 128 * 1024 * 1024, MaxStore: 32 * 1024 * 1024 * 1024}
+	if err := s.EnableJetStream(jsconfig); err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
 
 	if config := s.JetStreamConfig(); config != nil {
 		defer os.RemoveAll(config.StoreDir)
@@ -5957,11 +6900,6 @@ func TestJetStreamSimpleFileStorageRecovery(t *testing.T) {
 	pusage := acc.JetStreamUsage()
 
 	// Shutdown the server. Restart and make sure things come back.
-	// Capture port since it was dynamic.
-	u, _ := url.Parse(s.ClientURL())
-	port, _ := strconv.Atoi(u.Port())
-	sd := s.JetStreamConfig().StoreDir
-
 	s.Shutdown()
 
 	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
@@ -5972,8 +6910,12 @@ func TestJetStreamSimpleFileStorageRecovery(t *testing.T) {
 		return nil
 	})
 
-	s = RunJetStreamServerOnPort(port, sd)
+	s = RunRandClientPortServer()
 	defer s.Shutdown()
+
+	if err := s.EnableJetStream(jsconfig); err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
 
 	acc = s.GlobalAccount()
 
@@ -6118,6 +7060,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 	if err = json.Unmarshal(resp.Data, &namesResponse); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
+
 	if len(namesResponse.Streams) != 1 {
 		t.Fatalf("Expected only 1 stream but got %d", len(namesResponse.Streams))
 	}
@@ -6189,7 +7132,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 	}
 	checkNotFound(bResp.Error, "stream not found")
 
-	// Now create an consumer.
+	// Now create a consumer.
 	delivery := nats.NewInbox()
 	obsReq := server.CreateConsumerRequest{
 		Stream: msetCfg.Name,
@@ -6282,11 +7225,11 @@ func TestJetStreamRequestAPI(t *testing.T) {
 	if oinfo.Config.DeliverSubject != delivery {
 		t.Fatalf("Expected to have delivery subject of %q, got %q", delivery, oinfo.Config.DeliverSubject)
 	}
-	if oinfo.Delivered.ConsumerSeq != 10 {
-		t.Fatalf("Expected consumer delivered sequence of 10, got %d", oinfo.Delivered.ConsumerSeq)
+	if oinfo.Delivered.Consumer != 10 {
+		t.Fatalf("Expected consumer delivered sequence of 10, got %d", oinfo.Delivered.Consumer)
 	}
-	if oinfo.AckFloor.ConsumerSeq != 10 {
-		t.Fatalf("Expected ack floor to be 10, got %d", oinfo.AckFloor.ConsumerSeq)
+	if oinfo.AckFloor.Consumer != 10 {
+		t.Fatalf("Expected ack floor to be 10, got %d", oinfo.AckFloor.Consumer)
 	}
 
 	// Now delete the consumer.
@@ -6541,6 +7484,59 @@ func TestJetStreamRequestAPI(t *testing.T) {
 	checkEmptyReqArg(" { } ")
 }
 
+func TestJetStreamFilteredStreamNames(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	// Forced cleanup of all persisted state.
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	// Client for API requests.
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	// Create some streams.
+	var snid int
+	createStream := func(subjects []string) {
+		t.Helper()
+		snid++
+		name := fmt.Sprintf("S-%d", snid)
+		sc := &server.StreamConfig{Name: name, Subjects: subjects}
+		if _, err := s.GlobalAccount().AddStream(sc); err != nil {
+			t.Fatalf("Unexpected error adding stream: %v", err)
+		}
+	}
+
+	createStream([]string{"foo"})                  // S1
+	createStream([]string{"bar"})                  // S2
+	createStream([]string{"baz"})                  // S3
+	createStream([]string{"foo.*", "bar.*"})       // S4
+	createStream([]string{"foo-1.22", "bar-1.33"}) // S5
+
+	expectStreams := func(filter string, streams []string) {
+		t.Helper()
+		req, _ := json.Marshal(&server.JSApiStreamNamesRequest{Subject: filter})
+		r, _ := nc.Request(server.JSApiStreams, req, time.Second)
+		var resp server.JSApiStreamNamesResponse
+		if err := json.Unmarshal(r.Data, &resp); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if len(resp.Streams) != len(streams) {
+			t.Fatalf("Expected %d results, got %d", len(streams), len(resp.Streams))
+		}
+	}
+
+	expectStreams("foo", []string{"S1"})
+	expectStreams("bar", []string{"S2"})
+	expectStreams("baz", []string{"S3"})
+	expectStreams("*", []string{"S1", "S2", "S3"})
+	expectStreams(">", []string{"S1", "S2", "S3", "S4", "S5"})
+	expectStreams("*.*", []string{"S4", "S5"})
+	expectStreams("*.22", []string{"S4", "S5"})
+}
+
 func TestJetStreamAPIStreamListPaging(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer s.Shutdown()
@@ -6550,8 +7546,8 @@ func TestJetStreamAPIStreamListPaging(t *testing.T) {
 		defer os.RemoveAll(config.StoreDir)
 	}
 
-	// Create 4X limit
-	streamsNum := 4 * server.JSApiNamesLimit
+	// Create 2X limit
+	streamsNum := 2 * server.JSApiNamesLimit
 	for i := 1; i <= streamsNum; i++ {
 		name := fmt.Sprintf("STREAM-%06d", i)
 		cfg := server.StreamConfig{Name: name}
@@ -6569,7 +7565,7 @@ func TestJetStreamAPIStreamListPaging(t *testing.T) {
 		t.Helper()
 		var req []byte
 		if offset > 0 {
-			req, _ = json.Marshal(&server.JSApiStreamNamesRequest{ApiPagedRequest: server.ApiPagedRequest{Offset: offset}})
+			req, _ = json.Marshal(&server.ApiPagedRequest{Offset: offset})
 		}
 		resp, err := nc.Request(server.JSApiStreams, req, time.Second)
 		if err != nil {
@@ -6605,7 +7601,6 @@ func TestJetStreamAPIStreamListPaging(t *testing.T) {
 
 	checkResp(reqList(0), server.JSApiNamesLimit, 0)
 	checkResp(reqList(server.JSApiNamesLimit), server.JSApiNamesLimit, server.JSApiNamesLimit)
-	checkResp(reqList(2*server.JSApiNamesLimit), server.JSApiNamesLimit, 2*server.JSApiNamesLimit)
 	checkResp(reqList(streamsNum), 0, streamsNum)
 	checkResp(reqList(streamsNum-22), 22, streamsNum-22)
 	checkResp(reqList(streamsNum+22), 0, streamsNum)
@@ -6630,13 +7625,14 @@ func TestJetStreamAPIConsumerListPaging(t *testing.T) {
 	nc := clientConnectToServer(t, s)
 	defer nc.Close()
 
-	sub, _ := nc.SubscribeSync("d.*")
-	defer sub.Unsubscribe()
-	nc.Flush()
-
 	consumersNum := server.JSApiNamesLimit
 	for i := 1; i <= consumersNum; i++ {
-		_, err := mset.AddConsumer(&server.ConsumerConfig{DeliverSubject: fmt.Sprintf("d.%d", i)})
+		dsubj := fmt.Sprintf("d.%d", i)
+		sub, _ := nc.SubscribeSync(dsubj)
+		defer sub.Unsubscribe()
+		nc.Flush()
+
+		_, err := mset.AddConsumer(&server.ConsumerConfig{DeliverSubject: dsubj})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -7060,6 +8056,60 @@ func TestJetStreamDeleteMsg(t *testing.T) {
 	}
 }
 
+// https://github.com/nats-io/jetstream/issues/396
+func TestJetStreamLimitLockBug(t *testing.T) {
+	cases := []struct {
+		name    string
+		mconfig *server.StreamConfig
+	}{
+		{name: "MemoryStore",
+			mconfig: &server.StreamConfig{
+				Name:      "foo",
+				Retention: server.LimitsPolicy,
+				MaxMsgs:   10,
+				Storage:   server.MemoryStorage,
+				Replicas:  1,
+			}},
+		{name: "FileStore",
+			mconfig: &server.StreamConfig{
+				Name:      "foo",
+				Retention: server.LimitsPolicy,
+				MaxMsgs:   10,
+				Storage:   server.FileStorage,
+				Replicas:  1,
+			}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil && config.StoreDir != "" {
+				defer os.RemoveAll(config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().AddStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+
+			nc := clientConnectToServer(t, s)
+			defer nc.Close()
+
+			for i := 0; i < 100; i++ {
+				sendStreamMsg(t, nc, "foo", "ok")
+			}
+
+			state := mset.State()
+			if state.Msgs != 10 {
+				t.Fatalf("Expected 10 messages, got %d", state.Msgs)
+			}
+		})
+	}
+}
+
 func TestJetStreamNextMsgNoInterest(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -7142,7 +8192,7 @@ func TestJetStreamNextMsgNoInterest(t *testing.T) {
 			}
 			nc.Flush()
 			ostate := o.Info()
-			if ostate.AckFloor.StreamSeq != 11 || ostate.NumPending > 0 {
+			if ostate.AckFloor.Stream != 11 || ostate.NumAckPending > 0 {
 				t.Fatalf("Inconsistent ack state: %+v", ostate)
 			}
 		})
@@ -7802,6 +8852,179 @@ func TestJetStreamPubPerf(t *testing.T) {
 	fmt.Printf("%.0f msgs/sec\n", float64(toSend)/tt.Seconds())
 }
 
+func TestJetStreamPubWithAsyncResponsePerf(t *testing.T) {
+	// Comment out to run, holding place for now.
+	t.SkipNow()
+
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	acc := s.GlobalAccount()
+
+	msetConfig := server.StreamConfig{
+		Name:     "sr33",
+		Storage:  server.MemoryStorage,
+		Subjects: []string{"foo"},
+	}
+
+	if _, err := acc.AddStream(&msetConfig); err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	toSend := 1000000
+	payload := []byte("Hello World")
+
+	start := time.Now()
+	for i := 0; i < toSend; i++ {
+		nc.PublishRequest("foo", "bar", payload)
+	}
+	nc.Flush()
+
+	tt := time.Since(start)
+	fmt.Printf("time is %v\n", tt)
+	fmt.Printf("%.0f msgs/sec\n", float64(toSend)/tt.Seconds())
+}
+
+func TestJetStreamConsumerPerf(t *testing.T) {
+	// Comment out to run, holding place for now.
+	t.SkipNow()
+
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	acc := s.GlobalAccount()
+
+	msetConfig := server.StreamConfig{
+		Name:     "sr22",
+		Storage:  server.MemoryStorage,
+		Subjects: []string{"foo"},
+	}
+
+	mset, err := acc.AddStream(&msetConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	payload := []byte("Hello World")
+
+	toStore := 2000000
+	for i := 0; i < toStore; i++ {
+		nc.Publish("foo", payload)
+	}
+	nc.Flush()
+
+	_, err = mset.AddConsumer(&server.ConsumerConfig{
+		Durable:        "d",
+		DeliverSubject: "d",
+		AckPolicy:      server.AckNone,
+	})
+	if err != nil {
+		t.Fatalf("Error creating consumer: %v", err)
+	}
+
+	var received int
+	done := make(chan bool)
+
+	nc.Subscribe("d", func(m *nats.Msg) {
+		received++
+		if received >= toStore {
+			done <- true
+		}
+	})
+	start := time.Now()
+	nc.Flush()
+
+	<-done
+	tt := time.Since(start)
+	fmt.Printf("time is %v\n", tt)
+	fmt.Printf("%.0f msgs/sec\n", float64(toStore)/tt.Seconds())
+}
+
+func TestJetStreamConsumerAckFileStorePerf(t *testing.T) {
+	// Comment out to run, holding place for now.
+	t.SkipNow()
+
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	acc := s.GlobalAccount()
+
+	msetConfig := server.StreamConfig{
+		Name:     "sr22",
+		Storage:  server.FileStorage,
+		Subjects: []string{"foo"},
+	}
+
+	mset, err := acc.AddStream(&msetConfig)
+	if err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	payload := []byte("Hello World")
+
+	toStore := uint64(200000)
+	for i := uint64(0); i < toStore; i++ {
+		nc.Publish("foo", payload)
+	}
+	nc.Flush()
+
+	if msgs := mset.State().Msgs; msgs != uint64(toStore) {
+		t.Fatalf("Expected %d messages, got %d", toStore, msgs)
+	}
+
+	o, err := mset.AddConsumer(&server.ConsumerConfig{
+		Durable:        "d",
+		DeliverSubject: "d",
+		AckPolicy:      server.AckExplicit,
+		AckWait:        10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Error creating consumer: %v", err)
+	}
+	defer o.Stop()
+
+	var received uint64
+	done := make(chan bool)
+
+	sub, _ := nc.Subscribe("d", func(m *nats.Msg) {
+		m.Respond(nil) // Ack
+		received++
+		if received >= toStore {
+			done <- true
+		}
+	})
+	sub.SetPendingLimits(-1, -1)
+
+	start := time.Now()
+	nc.Flush()
+
+	<-done
+	tt := time.Since(start)
+	fmt.Printf("time is %v\n", tt)
+	fmt.Printf("%.0f msgs/sec\n", float64(toStore)/tt.Seconds())
+}
+
 func TestJetStreamPubSubPerf(t *testing.T) {
 	// Comment out to run, holding place for now.
 	t.SkipNow()
@@ -7922,13 +9145,14 @@ func TestJetStreamAckExplicitMsgRemoval(t *testing.T) {
 
 			sub2, _ := nc2.SubscribeSync(nats.NewInbox())
 			defer sub2.Unsubscribe()
+			nc2.Flush()
 
 			o2, err := mset.AddConsumer(&server.ConsumerConfig{
 				Durable:        "dur2",
 				DeliverSubject: sub2.Subject,
 				FilterSubject:  "foo.bar",
 				AckPolicy:      server.AckExplicit,
-				AckWait:        25 * time.Millisecond,
+				AckWait:        100 * time.Millisecond,
 			})
 			if err != nil {
 				t.Fatalf("Unexpected error adding consumer: %v", err)
@@ -7957,11 +9181,16 @@ func TestJetStreamAckExplicitMsgRemoval(t *testing.T) {
 				}
 			}
 			// To make sure acks are processed for checking state after sending new ones.
-			nc1.Flush()
-			nc2.Flush()
+			checkFor(t, time.Second, 25*time.Millisecond, func() error {
+				if state = mset.State(); state.Msgs != 0 {
+					return fmt.Errorf("Stream still has messages")
+				}
+				return nil
+			})
 
 			// Now close the 2nd subscription...
 			sub2.Unsubscribe()
+			nc2.Flush()
 
 			// Send 2 more new messages
 			for i := 0; i < toSend; i++ {
@@ -7976,7 +9205,7 @@ func TestJetStreamAckExplicitMsgRemoval(t *testing.T) {
 			for i := 0; i < toSend; i++ {
 				m, err := sub1.NextMsg(time.Second)
 				if err != nil {
-					t.Fatalf("Error acking message: %v", err)
+					t.Fatalf("Error getting message to ack: %v", err)
 				}
 				m.Respond(nil)
 			}
@@ -7992,7 +9221,7 @@ func TestJetStreamAckExplicitMsgRemoval(t *testing.T) {
 				DeliverSubject: sub2.Subject,
 				FilterSubject:  "foo.bar",
 				AckPolicy:      server.AckExplicit,
-				AckWait:        25 * time.Millisecond,
+				AckWait:        100 * time.Millisecond,
 			})
 			if err != nil {
 				t.Fatalf("Unexpected error adding consumer: %v", err)
@@ -8016,4 +9245,1112 @@ func TestJetStreamAckExplicitMsgRemoval(t *testing.T) {
 			}
 		})
 	}
+}
+
+// This test is in support fo clients that want to match on subject, they
+// can set the filter subject always and if the stream only has one subject
+// and they match the filter is cleared automatically. This eliminates us
+// needing to know if a subject is a subset of a stream when looking it up.
+func TestJetStreamConsumerFilterSubject(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	sc := &server.StreamConfig{Name: "MY_STREAM", Subjects: []string{"foo"}}
+	mset, err := s.GlobalAccount().AddStream(sc)
+	if err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+	defer mset.Delete()
+
+	cfg := &server.ConsumerConfig{
+		Durable:        "d",
+		DeliverSubject: "A",
+		AckPolicy:      server.AckExplicit,
+		FilterSubject:  "foo",
+	}
+
+	o, err := mset.AddConsumer(cfg)
+	if err != nil {
+		t.Fatalf("Unexpected error adding consumer: %v", err)
+	}
+	defer o.Delete()
+
+	if o.Info().Config.FilterSubject != "" {
+		t.Fatalf("Expected the filter to be cleared")
+	}
+
+	// Now use the original cfg with updated delivery subject and make sure that works ok.
+	cfg = &server.ConsumerConfig{
+		Durable:        "d",
+		DeliverSubject: "B",
+		AckPolicy:      server.AckExplicit,
+		FilterSubject:  "foo",
+	}
+
+	o, err = mset.AddConsumer(cfg)
+	if err != nil {
+		t.Fatalf("Unexpected error adding consumer: %v", err)
+	}
+	defer o.Delete()
+}
+
+func TestJetStreamStoredMsgsDontDisappearAfterCacheExpiration(t *testing.T) {
+	sc := &server.StreamConfig{
+		Name:      "MY_STREAM",
+		Storage:   server.FileStorage,
+		Subjects:  []string{"foo.>"},
+		Retention: server.InterestPolicy,
+	}
+
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	mset, err := s.GlobalAccount().AddStreamWithStore(sc, &server.FileStoreConfig{BlockSize: 128, CacheExpire: 15 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+	defer mset.Delete()
+
+	nc1 := clientConnectWithOldRequest(t, s)
+	defer nc1.Close()
+
+	// Create a durable consumers
+	sub, _ := nc1.SubscribeSync(nats.NewInbox())
+	defer sub.Unsubscribe()
+	nc1.Flush()
+
+	o, err := mset.AddConsumer(&server.ConsumerConfig{
+		Durable:        "dur",
+		DeliverSubject: sub.Subject,
+		FilterSubject:  "foo.bar",
+		DeliverPolicy:  server.DeliverNew,
+		AckPolicy:      server.AckExplicit,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error adding consumer: %v", err)
+	}
+	defer o.Delete()
+
+	nc2 := clientConnectWithOldRequest(t, s)
+	defer nc2.Close()
+
+	sendStreamMsg(t, nc2, "foo.bar", "msg1")
+
+	msg, err := sub.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("Did not get message: %v", err)
+	}
+	if string(msg.Data) != "msg1" {
+		t.Fatalf("Unexpected message: %q", msg.Data)
+	}
+
+	nc1.Close()
+
+	// Get the message from the stream
+	getMsgSeq := func(seq uint64) {
+		t.Helper()
+		mreq := &server.JSApiMsgGetRequest{Seq: seq}
+		req, err := json.Marshal(mreq)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		smsgj, err := nc2.Request(fmt.Sprintf(server.JSApiMsgGetT, sc.Name), req, time.Second)
+		if err != nil {
+			t.Fatalf("Could not retrieve stream message: %v", err)
+		}
+		if strings.Contains(string(smsgj.Data), "code") {
+			t.Fatalf("Error: %q", smsgj.Data)
+		}
+	}
+
+	getMsgSeq(1)
+
+	time.Sleep(time.Second)
+
+	sendStreamMsg(t, nc2, "foo.bar", "msg2")
+	sendStreamMsg(t, nc2, "foo.bar", "msg3")
+
+	getMsgSeq(1)
+	getMsgSeq(2)
+	getMsgSeq(3)
+}
+
+func TestJetStreamConsumerUpdateRedelivery(t *testing.T) {
+	cases := []struct {
+		name    string
+		mconfig *server.StreamConfig
+	}{
+		{"MemoryStore", &server.StreamConfig{
+			Name:      "MY_STREAM",
+			Storage:   server.MemoryStorage,
+			Subjects:  []string{"foo.>"},
+			Retention: server.InterestPolicy,
+		}},
+		{"FileStore", &server.StreamConfig{
+			Name:      "MY_STREAM",
+			Storage:   server.FileStorage,
+			Subjects:  []string{"foo.>"},
+			Retention: server.InterestPolicy,
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer os.RemoveAll(config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().AddStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+			defer mset.Delete()
+
+			nc := clientConnectToServer(t, s)
+			defer nc.Close()
+
+			// Create a durable consumer.
+			sub, _ := nc.SubscribeSync(nats.NewInbox())
+			defer sub.Unsubscribe()
+
+			o, err := mset.AddConsumer(&server.ConsumerConfig{
+				Durable:        "dur22",
+				DeliverSubject: sub.Subject,
+				FilterSubject:  "foo.bar",
+				AckPolicy:      server.AckExplicit,
+				AckWait:        100 * time.Millisecond,
+				MaxDeliver:     3,
+			})
+			if err != nil {
+				t.Fatalf("Unexpected error adding consumer: %v", err)
+			}
+			defer o.Delete()
+
+			// Send 20 messages
+			toSend := 20
+			for i := 1; i <= toSend; i++ {
+				sendStreamMsg(t, nc, "foo.bar", fmt.Sprintf("msg-%v", i))
+			}
+			state := mset.State()
+			if state.Msgs != uint64(toSend) {
+				t.Fatalf("Expected %v messages, got %d", toSend, state.Msgs)
+			}
+
+			// Receive the messages and ack only every 4th
+			for i := 0; i < toSend; i++ {
+				m, err := sub.NextMsg(time.Second)
+				if err != nil {
+					t.Fatalf("Error getting message: %v", err)
+				}
+				seq, _, _, _, _ := o.ReplyInfo(m.Reply)
+				// 4, 8, 12, 16, 20
+				if seq%4 == 0 {
+					m.Respond(nil)
+				}
+			}
+
+			// Now close the sub and open a new one and update the consumer.
+			sub.Unsubscribe()
+
+			// Wait for it to become inactive
+			checkFor(t, 200*time.Millisecond, 10*time.Millisecond, func() error {
+				if o.Active() {
+					return fmt.Errorf("Consumer still active")
+				}
+				return nil
+			})
+
+			// Send 20 more messages.
+			for i := toSend; i < toSend*2; i++ {
+				sendStreamMsg(t, nc, "foo.bar", fmt.Sprintf("msg-%v", i))
+			}
+
+			// Create new subscription.
+			sub, _ = nc.SubscribeSync(nats.NewInbox())
+			defer sub.Unsubscribe()
+			nc.Flush()
+
+			o, err = mset.AddConsumer(&server.ConsumerConfig{
+				Durable:        "dur22",
+				DeliverSubject: sub.Subject,
+				FilterSubject:  "foo.bar",
+				AckPolicy:      server.AckExplicit,
+				AckWait:        100 * time.Millisecond,
+				MaxDeliver:     3,
+			})
+			if err != nil {
+				t.Fatalf("Unexpected error adding consumer: %v", err)
+			}
+			defer o.Delete()
+
+			expect := toSend + toSend - 5 // mod 4 acks
+			checkFor(t, time.Second, 5*time.Millisecond, func() error {
+				if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != expect {
+					return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, expect)
+				}
+				return nil
+			})
+
+			for i, eseq := 0, uint64(1); i < expect; i++ {
+				m, err := sub.NextMsg(time.Second)
+				if err != nil {
+					t.Fatalf("Error getting message: %v", err)
+				}
+				// Skip the ones we ack'd from above. We should not get them back here.
+				if eseq <= uint64(toSend) && eseq%4 == 0 {
+					eseq++
+				}
+				seq, _, dc, _, _ := o.ReplyInfo(m.Reply)
+				if seq != eseq {
+					t.Fatalf("Expected stream sequence of %d, got %d", eseq, seq)
+				}
+				if seq <= uint64(toSend) && dc != 2 {
+					t.Fatalf("Expected delivery count of 2 for sequence of %d, got %d", seq, dc)
+				}
+				if seq > uint64(toSend) && dc != 1 {
+					t.Fatalf("Expected delivery count of 1 for sequence of %d, got %d", seq, dc)
+				}
+				if seq > uint64(toSend) {
+					m.Respond(nil) // Ack
+				}
+				eseq++
+			}
+
+			// We should get the second half back since we did not ack those from above.
+			expect = toSend - 5
+			checkFor(t, time.Second, 5*time.Millisecond, func() error {
+				if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != expect {
+					return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, expect)
+				}
+				return nil
+			})
+
+			for i, eseq := 0, uint64(1); i < expect; i++ {
+				m, err := sub.NextMsg(time.Second)
+				if err != nil {
+					t.Fatalf("Error getting message: %v", err)
+				}
+				// Skip the ones we ack'd from above. We should not get them back here.
+				if eseq <= uint64(toSend) && eseq%4 == 0 {
+					eseq++
+				}
+				seq, _, dc, _, _ := o.ReplyInfo(m.Reply)
+				if seq != eseq {
+					t.Fatalf("Expected stream sequence of %d, got %d", eseq, seq)
+				}
+				if dc != 3 {
+					t.Fatalf("Expected delivery count of 3 for sequence of %d, got %d", seq, dc)
+				}
+				eseq++
+			}
+		})
+	}
+}
+
+func TestJetStreamConsumerMaxAckPending(t *testing.T) {
+	cases := []struct {
+		name    string
+		mconfig *server.StreamConfig
+	}{
+		{"MemoryStore", &server.StreamConfig{
+			Name:     "MY_STREAM",
+			Storage:  server.MemoryStorage,
+			Subjects: []string{"foo.*"},
+		}},
+		{"FileStore", &server.StreamConfig{
+			Name:     "MY_STREAM",
+			Storage:  server.FileStorage,
+			Subjects: []string{"foo.*"},
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer os.RemoveAll(config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().AddStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+			defer mset.Delete()
+
+			nc := clientConnectToServer(t, s)
+			defer nc.Close()
+
+			// Do error scenarios.
+			_, err = mset.AddConsumer(&server.ConsumerConfig{
+				Durable:        "d22",
+				DeliverSubject: nats.NewInbox(),
+				AckPolicy:      server.AckNone,
+				MaxAckPending:  1,
+			})
+			if err == nil {
+				t.Fatalf("Expected error, MaxAckPending only applicable to ack != AckNone")
+			}
+
+			// Queue up 100 messages.
+			toSend := 100
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "foo.bar", fmt.Sprintf("MSG: %d", i+1))
+			}
+
+			// Limit to 33
+			maxAckPending := 33
+
+			o, err := mset.AddConsumer(&server.ConsumerConfig{
+				Durable:        "d22",
+				DeliverSubject: nats.NewInbox(),
+				AckPolicy:      server.AckExplicit,
+				MaxAckPending:  maxAckPending,
+			})
+			if err != nil {
+				t.Fatalf("Expected no error, got %v", err)
+			}
+			defer o.Delete()
+
+			sub, _ := nc.SubscribeSync(o.Info().Config.DeliverSubject)
+			defer sub.Unsubscribe()
+
+			checkSubPending := func(numExpected int) {
+				t.Helper()
+				checkFor(t, 200*time.Millisecond, 10*time.Millisecond, func() error {
+					if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != numExpected {
+						return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, numExpected)
+					}
+					return nil
+				})
+			}
+
+			checkSubPending(maxAckPending)
+			// We hit the limit, double check we stayed there.
+			if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != maxAckPending {
+				t.Fatalf("Too many messages received: %d vs %d", nmsgs, maxAckPending)
+			}
+
+			// Now ack them all.
+			for i := 0; i < maxAckPending; i++ {
+				m, err := sub.NextMsg(time.Second)
+				if err != nil {
+					t.Fatalf("Error receiving message %d: %v", i, err)
+				}
+				m.Respond(nil)
+			}
+			checkSubPending(maxAckPending)
+
+			o.Stop()
+			mset.Purge()
+
+			// Now test a consumer that is live while we publish messages to the stream.
+			o, err = mset.AddConsumer(&server.ConsumerConfig{
+				Durable:        "d22",
+				DeliverSubject: nats.NewInbox(),
+				AckPolicy:      server.AckExplicit,
+				MaxAckPending:  maxAckPending,
+			})
+			if err != nil {
+				t.Fatalf("Expected no error, got %v", err)
+			}
+			defer o.Delete()
+
+			sub, _ = nc.SubscribeSync(o.Info().Config.DeliverSubject)
+			defer sub.Unsubscribe()
+			nc.Flush()
+
+			checkSubPending(0)
+
+			// Now stream more then maxAckPending.
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "foo.baz", fmt.Sprintf("MSG: %d", i+1))
+			}
+			checkSubPending(maxAckPending)
+			// We hit the limit, double check we stayed there.
+			if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != maxAckPending {
+				t.Fatalf("Too many messages received: %d vs %d", nmsgs, maxAckPending)
+			}
+		})
+	}
+}
+
+func TestJetStreamPullConsumerMaxAckPending(t *testing.T) {
+	cases := []struct {
+		name    string
+		mconfig *server.StreamConfig
+	}{
+		{"MemoryStore", &server.StreamConfig{
+			Name:     "MY_STREAM",
+			Storage:  server.MemoryStorage,
+			Subjects: []string{"foo.*"},
+		}},
+		{"FileStore", &server.StreamConfig{
+			Name:     "MY_STREAM",
+			Storage:  server.FileStorage,
+			Subjects: []string{"foo.*"},
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer os.RemoveAll(config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().AddStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+			defer mset.Delete()
+
+			nc := clientConnectToServer(t, s)
+			defer nc.Close()
+
+			// Queue up 100 messages.
+			toSend := 100
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "foo.bar", fmt.Sprintf("MSG: %d", i+1))
+			}
+
+			// Limit to 33
+			maxAckPending := 33
+
+			o, err := mset.AddConsumer(&server.ConsumerConfig{
+				Durable:       "d22",
+				AckPolicy:     server.AckExplicit,
+				MaxAckPending: maxAckPending,
+			})
+			if err != nil {
+				t.Fatalf("Expected no error, got %v", err)
+			}
+			defer o.Delete()
+
+			getSubj := o.RequestNextMsgSubject()
+
+			var toAck []*nats.Msg
+
+			for i := 0; i < maxAckPending; i++ {
+				if m, err := nc.Request(getSubj, nil, time.Second); err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				} else {
+					toAck = append(toAck, m)
+				}
+			}
+			// This should fail.. But we do not want to queue up our request.
+			req := &server.JSApiConsumerGetNextRequest{Batch: 1, NoWait: true}
+			jreq, _ := json.Marshal(req)
+			m, err := nc.Request(getSubj, jreq, time.Second)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if m.Header.Get("Status") != "409" {
+				t.Fatalf("Expected a 409 status code, got %q", m.Header.Get("Status"))
+			}
+
+			// Now ack them all.
+			for _, m := range toAck {
+				m.Respond(nil)
+			}
+
+			// Now do batch above the max.
+			sub, _ := nc.SubscribeSync(nats.NewInbox())
+			defer sub.Unsubscribe()
+
+			checkSubPending := func(numExpected int) {
+				t.Helper()
+				checkFor(t, time.Second, 10*time.Millisecond, func() error {
+					if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != numExpected {
+						return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, numExpected)
+					}
+					return nil
+				})
+			}
+
+			req = &server.JSApiConsumerGetNextRequest{Batch: toSend}
+			jreq, _ = json.Marshal(req)
+			nc.PublishRequest(getSubj, sub.Subject, jreq)
+
+			checkSubPending(maxAckPending)
+			// We hit the limit, double check we stayed there.
+			if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != maxAckPending {
+				t.Fatalf("Too many messages received: %d vs %d", nmsgs, maxAckPending)
+			}
+		})
+	}
+}
+
+func TestJetStreamPullConsumerMaxAckPendingRedeliveries(t *testing.T) {
+	cases := []struct {
+		name    string
+		mconfig *server.StreamConfig
+	}{
+		{"MemoryStore", &server.StreamConfig{
+			Name:     "MY_STREAM",
+			Storage:  server.MemoryStorage,
+			Subjects: []string{"foo.*"},
+		}},
+		{"FileStore", &server.StreamConfig{
+			Name:     "MY_STREAM",
+			Storage:  server.FileStorage,
+			Subjects: []string{"foo.*"},
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer os.RemoveAll(config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().AddStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+			defer mset.Delete()
+
+			nc := clientConnectToServer(t, s)
+			defer nc.Close()
+
+			// Queue up 10 messages.
+			toSend := 10
+			for i := 0; i < toSend; i++ {
+				sendStreamMsg(t, nc, "foo.bar", fmt.Sprintf("MSG: %d", i+1))
+			}
+
+			// Limit to 1
+			maxAckPending := 1
+			ackWait := 20 * time.Millisecond
+			expSeq := uint64(4)
+
+			o, err := mset.AddConsumer(&server.ConsumerConfig{
+				Durable:       "d22",
+				DeliverPolicy: server.DeliverByStartSequence,
+				OptStartSeq:   expSeq,
+				AckPolicy:     server.AckExplicit,
+				AckWait:       ackWait,
+				MaxAckPending: maxAckPending,
+			})
+			if err != nil {
+				t.Fatalf("Expected no error, got %v", err)
+			}
+			defer o.Delete()
+
+			getSubj := o.RequestNextMsgSubject()
+			delivery := uint64(1)
+
+			getNext := func() {
+				t.Helper()
+				m, err := nc.Request(getSubj, nil, time.Second)
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				sseq, dseq, dcount, _, pending := o.ReplyInfo(m.Reply)
+				if sseq != expSeq {
+					t.Fatalf("Expected stream sequence of %d, got %d", expSeq, sseq)
+				}
+				if dseq != delivery {
+					t.Fatalf("Expected consumer sequence of %d, got %d", delivery, dseq)
+				}
+				if dcount != delivery {
+					t.Fatalf("Expected delivery count of %d, got %d", delivery, dcount)
+				}
+				if pending != uint64(toSend)-expSeq {
+					t.Fatalf("Expected pending to be %d, got %d", uint64(toSend)-expSeq, pending)
+				}
+				delivery++
+			}
+
+			getNext()
+			getNext()
+			getNext()
+			getNext()
+			getNext()
+		})
+	}
+}
+
+func TestJetStreamDeliveryAfterServerRestart(t *testing.T) {
+	opts := DefaultTestOptions
+	opts.Port = -1
+	opts.JetStream = true
+	s := RunServer(&opts)
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	mset, err := s.GlobalAccount().AddStream(&server.StreamConfig{
+		Name:      "MY_STREAM",
+		Storage:   server.FileStorage,
+		Subjects:  []string{"foo.>"},
+		Retention: server.InterestPolicy,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+	defer mset.Delete()
+
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	inbox := nats.NewInbox()
+	o, err := mset.AddConsumer(&server.ConsumerConfig{
+		Durable:        "dur",
+		DeliverSubject: inbox,
+		DeliverPolicy:  server.DeliverNew,
+		AckPolicy:      server.AckExplicit,
+	})
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	defer o.Delete()
+
+	sub, err := nc.SubscribeSync(inbox)
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	nc.Flush()
+
+	// Send 1 message
+	sendStreamMsg(t, nc, "foo.bar", "msg1")
+
+	// Make sure we receive it and ack it.
+	msg, err := sub.NextMsg(250 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("Did not get message: %v", err)
+	}
+	// Ack it!
+	msg.Respond(nil)
+	nc.Flush()
+
+	// Shutdown client and server
+	nc.Close()
+
+	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, server.JetStreamStoreDir)
+	s.Shutdown()
+
+	opts.Port = -1
+	opts.StoreDir = dir
+	s = RunServer(&opts)
+	defer s.Shutdown()
+
+	// Lookup stream.
+	mset, err = s.GlobalAccount().LookupStream("MY_STREAM")
+	if err != nil {
+		t.Fatalf("Error looking up stream: %v", err)
+	}
+
+	// Update consumer's deliver subject with new inbox
+	inbox = nats.NewInbox()
+	o, err = mset.AddConsumer(&server.ConsumerConfig{
+		Durable:        "dur",
+		DeliverSubject: inbox,
+		DeliverPolicy:  server.DeliverNew,
+		AckPolicy:      server.AckExplicit,
+	})
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	defer o.Delete()
+
+	nc = clientConnectToServer(t, s)
+	defer nc.Close()
+
+	// Send 2nd message
+	sendStreamMsg(t, nc, "foo.bar", "msg2")
+
+	// Start sub on new inbox
+	sub, err = nc.SubscribeSync(inbox)
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	nc.Flush()
+
+	// Should receive message 2.
+	if _, err := sub.NextMsg(500 * time.Millisecond); err != nil {
+		t.Fatalf("Did not get message: %v", err)
+	}
+}
+
+// This is for the basics of importing the ability to send to a stream and consume
+// from a consumer that is pull based on push based on a well known delivery subject.
+func TestJetStreamAccountImportBasics(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		no_auth_user: rip
+		jetstream: {max_mem_store: 64GB, max_file_store: 10TB}
+		accounts: {
+			JS: {
+				jetstream: enabled
+				users: [ {user: dlc, password: foo} ]
+				exports [
+					# This is for sending into a stream from other accounts.
+					{ service: "ORDERS.*" }
+					# This is for accessing a pull based consumer.
+					{ service: "$JS.API.CONSUMER.MSG.NEXT.*.*" }
+					# This is streaming to a delivery subject for a push based consumer.
+					{ stream: "deliver.ORDERS" }
+					# This is to ack received messages. This is a service to ack acks..
+					{ service: "$JS.ACK.ORDERS.*.>" }
+				]
+			},
+			IU: {
+				users: [ {user: rip, password: bar} ]
+				imports [
+					{ service: { subject: "ORDERS.*", account: JS }, to: "my.orders.$1" }
+					{ service: { subject: "$JS.API.CONSUMER.MSG.NEXT.ORDERS.d", account: JS }, to: "nxt.msg" }
+					{ stream:  { subject: "deliver.ORDERS", account: JS }, to: "d" }
+					{ service: { subject: "$JS.ACK.ORDERS.*.>", account: JS } }
+				]
+			},
+		}
+	`))
+	defer os.Remove(conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	acc, err := s.LookupAccount("JS")
+	if err != nil {
+		t.Fatalf("Unexpected error looking up account: %v", err)
+	}
+
+	mset, err := acc.AddStream(&server.StreamConfig{Name: "ORDERS", Subjects: []string{"ORDERS.*"}})
+	if err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+	defer mset.Delete()
+
+	// This should be the rip user, the one that imports some JS.
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	// Simple publish to a stream.
+	pubAck := sendStreamMsg(t, nc, "my.orders.foo", "ORDERS-1")
+	if pubAck.Stream != "ORDERS" || pubAck.Sequence != 1 {
+		t.Fatalf("Bad pubAck received: %+v", pubAck)
+	}
+	if msgs := mset.State().Msgs; msgs != 1 {
+		t.Fatalf("Expected 1 message, got %d", msgs)
+	}
+
+	total := 2
+	for i := 2; i <= total; i++ {
+		sendStreamMsg(t, nc, "my.orders.bar", fmt.Sprintf("ORDERS-%d", i))
+	}
+	if msgs := mset.State().Msgs; msgs != uint64(total) {
+		t.Fatalf("Expected %d messages, got %d", total, msgs)
+	}
+
+	// Now test access to a pull based consumer, e.g. workqueue.
+	o, err := mset.AddConsumer(&server.ConsumerConfig{
+		Durable:   "d",
+		AckPolicy: server.AckExplicit,
+	})
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	defer o.Delete()
+
+	// We mapped the next message request, "$JS.API.CONSUMER.MSG.NEXT.ORDERS.d" -> "nxt.msg"
+	m, err := nc.Request("nxt.msg", nil, time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if string(m.Data) != "ORDERS-1" {
+		t.Fatalf("Expected to receive %q, got %q", "ORDERS-1", m.Data)
+	}
+
+	// Now test access to a push based consumer
+	o, err = mset.AddConsumer(&server.ConsumerConfig{
+		Durable:        "p",
+		DeliverSubject: "deliver.ORDERS",
+		AckPolicy:      server.AckExplicit,
+	})
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	defer o.Delete()
+
+	// We remapped from above, deliver.ORDERS -> d
+	sub, _ := nc.SubscribeSync("d")
+	defer sub.Unsubscribe()
+
+	checkFor(t, 250*time.Millisecond, 10*time.Millisecond, func() error {
+		if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != total {
+			return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, total)
+		}
+		return nil
+	})
+
+	m, _ = sub.NextMsg(time.Second)
+	// Make sure we remapped subject correctly across the account boundary.
+	if m.Subject != "ORDERS.foo" {
+		t.Fatalf("Expected subject of %q, got %q", "ORDERS.foo", m.Subject)
+	}
+	// Now make sure we can ack messages correctly.
+	m.Ack()
+	nc.Flush()
+
+	if info := o.Info(); info.AckFloor.Consumer != 1 {
+		t.Fatalf("Did not receive the ack properly")
+	}
+
+	// Grab second one now.
+	m, _ = sub.NextMsg(time.Second)
+	// Make sure we remapped subject correctly across the account boundary.
+	if m.Subject != "ORDERS.bar" {
+		t.Fatalf("Expected subject of %q, got %q", "ORDERS.bar", m.Subject)
+	}
+	// Now make sure we can ack messages and get back an ack as well.
+	resp, _ := nc.Request(m.Reply, nil, 100*time.Millisecond)
+	if resp == nil {
+		t.Fatalf("No response, possible timeout?")
+	}
+	if info := o.Info(); info.AckFloor.Consumer != 2 {
+		t.Fatalf("Did not receive the ack properly")
+	}
+}
+
+// This is for importing all of JetStream into another account for admin purposes.
+func TestJetStreamAccountImportAll(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		no_auth_user: rip
+		jetstream: {max_mem_store: 64GB, max_file_store: 10TB}
+		accounts: {
+			JS: {
+				jetstream: enabled
+				users: [ {user: dlc, password: foo} ]
+				exports [ { service: "$JS.API.>" } ]
+			},
+			IU: {
+				users: [ {user: rip, password: bar} ]
+				imports [ { service: { subject: "$JS.API.>", account: JS } , to: "jsapi.>" } ]
+			},
+		}
+	`))
+	defer os.Remove(conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	acc, err := s.LookupAccount("JS")
+	if err != nil {
+		t.Fatalf("Unexpected error looking up account: %v", err)
+	}
+
+	mset, err := acc.AddStream(&server.StreamConfig{Name: "ORDERS", Subjects: []string{"ORDERS.*"}})
+	if err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+	defer mset.Delete()
+
+	// This should be the rip user, the one that imports all of JS.
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	mapSubj := func(subject string) string {
+		return strings.Replace(subject, "$JS.API.", "jsapi.", 1)
+	}
+
+	// This will get the current information about usage and limits for this account.
+	resp, err := nc.Request(mapSubj(server.JSApiAccountInfo), nil, time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	var info server.JSApiAccountInfoResponse
+	if err := json.Unmarshal(resp.Data, &info); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if info.Error != nil {
+		t.Fatalf("Unexpected error: %+v", info.Error)
+	}
+	// Lookup streams.
+	resp, err = nc.Request(mapSubj(server.JSApiStreams), nil, time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	var namesResponse server.JSApiStreamNamesResponse
+	if err = json.Unmarshal(resp.Data, &namesResponse); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if namesResponse.Error != nil {
+		t.Fatalf("Unexpected error: %+v", namesResponse.Error)
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/1736
+func TestJetStreamServerReload(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		jetstream: {max_mem_store: 64GB, max_file_store: 10TB }
+		accounts: {
+			A: { users: [ {user: ua, password: pwd} ] },
+			B: {
+				jetstream: {max_mem: 1GB, max_store: 1TB, max_streams: 10, max_consumers: 1k}
+				users: [ {user: ub, password: pwd} ]
+			},
+			SYS: { users: [ {user: uc, password: pwd} ] },
+		}
+		no_auth_user: ub
+		system_account: SYS
+	`))
+	defer os.Remove(conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	if !s.JetStreamEnabled() {
+		t.Fatalf("Expected JetStream to be enabled")
+	}
+
+	// Client for API requests.
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	checkJSAccount := func() {
+		t.Helper()
+		resp, err := nc.Request(server.JSApiAccountInfo, nil, time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		var info server.JSApiAccountInfoResponse
+		if err := json.Unmarshal(resp.Data, &info); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+
+	checkJSAccount()
+
+	acc, err := s.LookupAccount("B")
+	if err != nil {
+		t.Fatalf("Unexpected error looking up account: %v", err)
+	}
+	mset, err := acc.AddStream(&server.StreamConfig{Name: "22"})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	toSend := 10
+	for i := 0; i < toSend; i++ {
+		sendStreamMsg(t, nc, "22", fmt.Sprintf("MSG: %d", i+1))
+	}
+	if msgs := mset.State().Msgs; msgs != uint64(toSend) {
+		t.Fatalf("Expected %d messages, got %d", toSend, msgs)
+	}
+
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Error on server reload: %v", err)
+	}
+
+	// Wait to get reconnected.
+	checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+		if !nc.IsConnected() {
+			return fmt.Errorf("Not connected")
+		}
+		return nil
+	})
+
+	checkJSAccount()
+	sendStreamMsg(t, nc, "22", "MSG: 22")
+}
+
+func TestJetStreamConfigReloadWithGlobalAccount(t *testing.T) {
+	template := `
+		authorization {
+			users [
+				{user: anonymous}
+				{user: user1, password: %s}
+			]
+		}
+		no_auth_user: anonymous
+		jetstream: enabled
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(template, "pwd")))
+	defer os.Remove(conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// Client for API requests.
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	checkJSAccount := func() {
+		t.Helper()
+		resp, err := nc.Request(server.JSApiAccountInfo, nil, time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		var info server.JSApiAccountInfoResponse
+		if err := json.Unmarshal(resp.Data, &info); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+
+	checkJSAccount()
+
+	mset, err := s.GlobalAccount().AddStream(&server.StreamConfig{Name: "foo"})
+	if err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+	defer mset.Delete()
+
+	toSend := 10
+	for i := 0; i < toSend; i++ {
+		sendStreamMsg(t, nc, "foo", fmt.Sprintf("MSG: %d", i+1))
+	}
+	if msgs := mset.State().Msgs; msgs != uint64(toSend) {
+		t.Fatalf("Expected %d messages, got %d", toSend, msgs)
+	}
+
+	if err := ioutil.WriteFile(conf, []byte(fmt.Sprintf(template, "pwd2")), 0666); err != nil {
+		t.Fatalf("Error writing config: %v", err)
+	}
+
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Error during config reload: %v", err)
+	}
+
+	// Try to add a new stream to the global account
+	mset2, err := s.GlobalAccount().AddStream(&server.StreamConfig{Name: "bar"})
+	if err != nil {
+		t.Fatalf("Unexpected error adding stream: %v", err)
+	}
+	defer mset2.Delete()
+
+	// Wait to get reconnected.
+	checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+		if !nc.IsConnected() {
+			return fmt.Errorf("Not connected")
+		}
+		return nil
+	})
+
+	checkJSAccount()
 }

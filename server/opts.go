@@ -57,20 +57,21 @@ func NoErrOnUnknownFields(noError bool) {
 // NOTE: This structure is no longer used for monitoring endpoints
 // and json tags are deprecated and may be removed in the future.
 type ClusterOpts struct {
-	Name           string            `json:"-"`
-	Host           string            `json:"addr,omitempty"`
-	Port           int               `json:"cluster_port,omitempty"`
-	Username       string            `json:"-"`
-	Password       string            `json:"-"`
-	AuthTimeout    float64           `json:"auth_timeout,omitempty"`
-	Permissions    *RoutePermissions `json:"-"`
-	TLSTimeout     float64           `json:"-"`
-	TLSConfig      *tls.Config       `json:"-"`
-	TLSMap         bool              `json:"-"`
-	ListenStr      string            `json:"-"`
-	Advertise      string            `json:"-"`
-	NoAdvertise    bool              `json:"-"`
-	ConnectRetries int               `json:"-"`
+	Name              string            `json:"-"`
+	Host              string            `json:"addr,omitempty"`
+	Port              int               `json:"cluster_port,omitempty"`
+	Username          string            `json:"-"`
+	Password          string            `json:"-"`
+	AuthTimeout       float64           `json:"auth_timeout,omitempty"`
+	Permissions       *RoutePermissions `json:"-"`
+	TLSTimeout        float64           `json:"-"`
+	TLSConfig         *tls.Config       `json:"-"`
+	TLSMap            bool              `json:"-"`
+	TLSCheckKnwonURLs bool              `json:"-"`
+	ListenStr         string            `json:"-"`
+	Advertise         string            `json:"-"`
+	NoAdvertise       bool              `json:"-"`
+	ConnectRetries    int               `json:"-"`
 
 	// Not exported (used in tests)
 	resolver netResolver
@@ -80,19 +81,20 @@ type ClusterOpts struct {
 // NOTE: This structure is no longer used for monitoring endpoints
 // and json tags are deprecated and may be removed in the future.
 type GatewayOpts struct {
-	Name           string               `json:"name"`
-	Host           string               `json:"addr,omitempty"`
-	Port           int                  `json:"port,omitempty"`
-	Username       string               `json:"-"`
-	Password       string               `json:"-"`
-	AuthTimeout    float64              `json:"auth_timeout,omitempty"`
-	TLSConfig      *tls.Config          `json:"-"`
-	TLSTimeout     float64              `json:"tls_timeout,omitempty"`
-	TLSMap         bool                 `json:"-"`
-	Advertise      string               `json:"advertise,omitempty"`
-	ConnectRetries int                  `json:"connect_retries,omitempty"`
-	Gateways       []*RemoteGatewayOpts `json:"gateways,omitempty"`
-	RejectUnknown  bool                 `json:"reject_unknown,omitempty"`
+	Name              string               `json:"name"`
+	Host              string               `json:"addr,omitempty"`
+	Port              int                  `json:"port,omitempty"`
+	Username          string               `json:"-"`
+	Password          string               `json:"-"`
+	AuthTimeout       float64              `json:"auth_timeout,omitempty"`
+	TLSConfig         *tls.Config          `json:"-"`
+	TLSTimeout        float64              `json:"tls_timeout,omitempty"`
+	TLSMap            bool                 `json:"-"`
+	TLSCheckKnownURLs bool                 `json:"-"`
+	Advertise         string               `json:"advertise,omitempty"`
+	ConnectRetries    int                  `json:"connect_retries,omitempty"`
+	Gateways          []*RemoteGatewayOpts `json:"gateways,omitempty"`
+	RejectUnknown     bool                 `json:"reject_unknown,omitempty"` // config got renamed to reject_unknown_cluster
 
 	// Not exported, for tests.
 	resolver         netResolver
@@ -195,6 +197,7 @@ type Options struct {
 	JetStreamMaxStore     int64         `json:"-"`
 	StoreDir              string        `json:"-"`
 	Websocket             WebsocketOpts `json:"-"`
+	MQTT                  MQTTOpts      `json:"-"`
 	ProfPort              int           `json:"-"`
 	PidFile               string        `json:"-"`
 	PortsFileDir          string        `json:"-"`
@@ -254,7 +257,7 @@ type Options struct {
 	routeProto           int
 }
 
-// WebsocketOpts ...
+// WebsocketOpts are options for websocket
 type WebsocketOpts struct {
 	// The server will accept websocket client connections on this hostname/IP.
 	Host string
@@ -312,6 +315,49 @@ type WebsocketOpts struct {
 	// and write the response back to the client. This include the
 	// time needed for the TLS Handshake.
 	HandshakeTimeout time.Duration
+}
+
+// MQTTOpts are options for MQTT
+type MQTTOpts struct {
+	// The server will accept MQTT client connections on this hostname/IP.
+	Host string
+	// The server will accept MQTT client connections on this port.
+	Port int
+
+	// If no user name is provided when a client connects, will default to the
+	// matching user from the global list of users in `Options.Users`.
+	NoAuthUser string
+
+	// Authentication section. If anything is configured in this section,
+	// it will override the authorization configuration of regular clients.
+	Username string
+	Password string
+	Token    string
+
+	// Timeout for the authentication process.
+	AuthTimeout float64
+
+	// TLS configuration is required.
+	TLSConfig *tls.Config
+	// If true, map certificate values for authentication purposes.
+	TLSMap bool
+	// Timeout for the TLS handshake
+	TLSTimeout float64
+
+	// AckWait is the amount of time after which a QoS 1 message sent to
+	// a client is redelivered as a DUPLICATE if the server has not
+	// received the PUBACK on the original Packet Identifier.
+	// The value has to be positive.
+	// Zero will cause the server to use the default value (1 hour).
+	// Note that changes to this option is applied only to new MQTT subscriptions.
+	AckWait time.Duration
+
+	// MaxAckPending is the amount of QoS 1 messages the server can send to
+	// a session without receiving any PUBACK for those messages.
+	// The valid range is [0..65535].
+	// Zero will cause the server to use the default value (1024).
+	// Note that changes to this option is applied only to new MQTT sessions.
+	MaxAckPending uint16
 }
 
 type netResolver interface {
@@ -391,15 +437,16 @@ type authorization struct {
 // TLSConfigOpts holds the parsed tls config information,
 // used with flag parsing
 type TLSConfigOpts struct {
-	CertFile         string
-	KeyFile          string
-	CaFile           string
-	Verify           bool
-	Insecure         bool
-	Map              bool
-	Timeout          float64
-	Ciphers          []uint16
-	CurvePreferences []tls.CurveID
+	CertFile          string
+	KeyFile           string
+	CaFile            string
+	Verify            bool
+	Insecure          bool
+	Map               bool
+	TLSCheckKnownURLs bool
+	Timeout           float64
+	Ciphers           []uint16
+	CurvePreferences  []tls.CurveID
 }
 
 var tlsUsage = `
@@ -745,7 +792,7 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 	case "ping_max":
 		o.MaxPingsOut = int(v.(int64))
 	case "tls":
-		tc, err := parseTLS(tk)
+		tc, err := parseTLS(tk, true)
 		if err != nil {
 			*errors = append(*errors, err)
 			return
@@ -924,7 +971,7 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 			*errors = append(*errors, err)
 		}
 	case "resolver_tls":
-		tc, err := parseTLS(tk)
+		tc, err := parseTLS(tk, true)
 		if err != nil {
 			*errors = append(*errors, err)
 			return
@@ -1005,6 +1052,11 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 		o.ReconnectErrorReports = int(v.(int64))
 	case "websocket", "ws":
 		if err := parseWebsocket(tk, o, errors, warnings); err != nil {
+			*errors = append(*errors, err)
+			return
+		}
+	case "mqtt":
+		if err := parseMQTT(tk, o, errors, warnings); err != nil {
 			*errors = append(*errors, err)
 			return
 		}
@@ -1160,6 +1212,7 @@ func parseCluster(v interface{}, opts *Options, errors *[]error, warnings *[]err
 			opts.Cluster.TLSConfig = config
 			opts.Cluster.TLSTimeout = tlsopts.Timeout
 			opts.Cluster.TLSMap = tlsopts.Map
+			opts.Cluster.TLSCheckKnwonURLs = tlsopts.TLSCheckKnownURLs
 		case "cluster_advertise", "advertise":
 			opts.Cluster.Advertise = mv.(string)
 		case "no_advertise":
@@ -1275,6 +1328,7 @@ func parseGateway(v interface{}, o *Options, errors *[]error, warnings *[]error)
 			o.Gateway.TLSConfig = config
 			o.Gateway.TLSTimeout = tlsopts.Timeout
 			o.Gateway.TLSMap = tlsopts.Map
+			o.Gateway.TLSCheckKnownURLs = tlsopts.TLSCheckKnownURLs
 		case "advertise":
 			o.Gateway.Advertise = mv.(string)
 		case "connect_retries":
@@ -1285,7 +1339,7 @@ func parseGateway(v interface{}, o *Options, errors *[]error, warnings *[]error)
 				return err
 			}
 			o.Gateway.Gateways = gateways
-		case "reject_unknown":
+		case "reject_unknown", "reject_unknown_cluster":
 			o.Gateway.RejectUnknown = mv.(bool)
 		default:
 			if !tk.IsUsedVariable() {
@@ -1481,7 +1535,7 @@ func parseLeafNodes(v interface{}, opts *Options, errors *[]error, warnings *[]e
 		case "reconnect", "reconnect_delay", "reconnect_interval":
 			opts.LeafNode.ReconnectInterval = time.Duration(int(mv.(int64))) * time.Second
 		case "tls":
-			tc, err := parseTLS(tk)
+			tc, err := parseTLS(tk, true)
 			if err != nil {
 				*errors = append(*errors, err)
 				continue
@@ -1678,7 +1732,7 @@ func parseRemoteLeafNodes(v interface{}, errors *[]error, warnings *[]error) ([]
 				}
 				remote.Credentials = p
 			case "tls":
-				tc, err := parseTLS(tk)
+				tc, err := parseTLS(tk, true)
 				if err != nil {
 					*errors = append(*errors, err)
 					continue
@@ -1733,7 +1787,7 @@ func parseRemoteLeafNodes(v interface{}, errors *[]error, warnings *[]error) ([]
 // Parse TLS and returns a TLSConfig and TLSTimeout.
 // Used by cluster and gateway parsing.
 func getTLSConfig(tk token) (*tls.Config, *TLSConfigOpts, error) {
-	tc, err := parseTLS(tk)
+	tc, err := parseTLS(tk, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2209,7 +2263,8 @@ func parseAccounts(v interface{}, opts *Options, errors *[]error, warnings *[]er
 		}
 
 		if service.lat != nil {
-			if opts.SystemAccount == "" {
+			// System accounts are on be default so just make sure we have not opted out..
+			if opts.NoSystemAccount {
 				msg := fmt.Sprintf("Error adding service latency sampling for %q: %v", service.sub, ErrNoSysAccount.Error())
 				*errors = append(*errors, &configErr{tk, msg})
 				continue
@@ -3202,7 +3257,7 @@ func parseCurvePreferences(curveName string) (tls.CurveID, error) {
 }
 
 // Helper function to parse TLS configs.
-func parseTLS(v interface{}) (t *TLSConfigOpts, retErr error) {
+func parseTLS(v interface{}, isClientCtx bool) (t *TLSConfigOpts, retErr error) {
 	var (
 		tlsm map[string]interface{}
 		tc   = TLSConfigOpts{}
@@ -3250,8 +3305,22 @@ func parseTLS(v interface{}) (t *TLSConfigOpts, retErr error) {
 			if !ok {
 				return nil, &configErr{tk, "error parsing tls config, expected 'verify_and_map' to be a boolean"}
 			}
-			tc.Verify = verify
+			if verify {
+				tc.Verify = verify
+			}
 			tc.Map = verify
+		case "verify_cert_and_check_known_urls":
+			verify, ok := mv.(bool)
+			if !ok {
+				return nil, &configErr{tk, "error parsing tls config, expected 'verify_cert_and_check_known_urls' to be a boolean"}
+			}
+			if verify && isClientCtx {
+				return nil, &configErr{tk, "verify_cert_and_check_known_urls not supported in this context"}
+			}
+			if verify {
+				tc.Verify = verify
+			}
+			tc.TLSCheckKnownURLs = verify
 		case "cipher_suites":
 			ra := mv.([]interface{})
 			if len(ra) == 0 {
@@ -3307,7 +3376,7 @@ func parseTLS(v interface{}) (t *TLSConfigOpts, retErr error) {
 	return &tc, nil
 }
 
-func parseAuthForWS(v interface{}, errors *[]error, warnings *[]error) *authorization {
+func parseSimpleAuth(v interface{}, errors *[]error, warnings *[]error) *authorization {
 	var (
 		am   map[string]interface{}
 		tk   token
@@ -3407,7 +3476,7 @@ func parseWebsocket(v interface{}, o *Options, errors *[]error, warnings *[]erro
 		case "no_tls":
 			o.Websocket.NoTLS = mv.(bool)
 		case "tls":
-			tc, err := parseTLS(tk)
+			tc, err := parseTLS(tk, true)
 			if err != nil {
 				*errors = append(*errors, err)
 				continue
@@ -3443,7 +3512,7 @@ func parseWebsocket(v interface{}, o *Options, errors *[]error, warnings *[]erro
 		case "compression":
 			o.Websocket.Compression = mv.(bool)
 		case "authorization", "authentication":
-			auth := parseAuthForWS(tk, errors, warnings)
+			auth := parseSimpleAuth(tk, errors, warnings)
 			o.Websocket.Username = auth.user
 			o.Websocket.Password = auth.pass
 			o.Websocket.Token = auth.token
@@ -3452,6 +3521,79 @@ func parseWebsocket(v interface{}, o *Options, errors *[]error, warnings *[]erro
 			o.Websocket.JWTCookie = mv.(string)
 		case "no_auth_user":
 			o.Websocket.NoAuthUser = mv.(string)
+		default:
+			if !tk.IsUsedVariable() {
+				err := &unknownConfigFieldErr{
+					field: mk,
+					configErr: configErr{
+						token: tk,
+					},
+				}
+				*errors = append(*errors, err)
+				continue
+			}
+		}
+	}
+	return nil
+}
+
+func parseMQTT(v interface{}, o *Options, errors *[]error, warnings *[]error) error {
+	var lt token
+	defer convertPanicToErrorList(&lt, errors)
+
+	tk, v := unwrapValue(v, &lt)
+	gm, ok := v.(map[string]interface{})
+	if !ok {
+		return &configErr{tk, fmt.Sprintf("Expected mqtt to be a map, got %T", v)}
+	}
+	for mk, mv := range gm {
+		// Again, unwrap token value if line check is required.
+		tk, mv = unwrapValue(mv, &lt)
+		switch strings.ToLower(mk) {
+		case "listen":
+			hp, err := parseListen(mv)
+			if err != nil {
+				err := &configErr{tk, err.Error()}
+				*errors = append(*errors, err)
+				continue
+			}
+			o.MQTT.Host = hp.host
+			o.MQTT.Port = hp.port
+		case "port":
+			o.MQTT.Port = int(mv.(int64))
+		case "host", "net":
+			o.MQTT.Host = mv.(string)
+		case "tls":
+			tc, err := parseTLS(tk, true)
+			if err != nil {
+				*errors = append(*errors, err)
+				continue
+			}
+			if o.MQTT.TLSConfig, err = GenTLSConfig(tc); err != nil {
+				err := &configErr{tk, err.Error()}
+				*errors = append(*errors, err)
+				continue
+			}
+			o.MQTT.TLSTimeout = tc.Timeout
+			o.MQTT.TLSMap = tc.Map
+		case "authorization", "authentication":
+			auth := parseSimpleAuth(tk, errors, warnings)
+			o.MQTT.Username = auth.user
+			o.MQTT.Password = auth.pass
+			o.MQTT.Token = auth.token
+			o.MQTT.AuthTimeout = auth.timeout
+		case "no_auth_user":
+			o.MQTT.NoAuthUser = mv.(string)
+		case "ack_wait", "ackwait":
+			o.MQTT.AckWait = parseDuration("ack_wait", tk, mv, errors, warnings)
+		case "max_ack_pending", "max_pending", "max_inflight":
+			tmp := int(mv.(int64))
+			if tmp < 0 || tmp > 0xFFFF {
+				err := &configErr{tk, fmt.Sprintf("invalid value %v, should in [0..%d] range", tmp, 0xFFFF)}
+				*errors = append(*errors, err)
+			} else {
+				o.MQTT.MaxAckPending = uint16(tmp)
+			}
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
@@ -3809,6 +3951,14 @@ func setBaselineOptions(opts *Options) {
 	if opts.Websocket.Port != 0 {
 		if opts.Websocket.Host == "" {
 			opts.Websocket.Host = DEFAULT_HOST
+		}
+	}
+	if opts.MQTT.Port != 0 {
+		if opts.MQTT.Host == "" {
+			opts.MQTT.Host = DEFAULT_HOST
+		}
+		if opts.MQTT.TLSTimeout == 0 {
+			opts.MQTT.TLSTimeout = float64(TLS_TIMEOUT) / float64(time.Second)
 		}
 	}
 	// JetStream
